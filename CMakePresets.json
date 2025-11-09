@@ -1,0 +1,92 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 23,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "hopper-release",
+      "displayName": "Hopper (Release)",
+      "description": "Optimized release build for Hopper architecture (SM90/SM90a) with Unity Build",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "${sourceDir}/.pixi/envs/default/bin/gcc",
+        "CMAKE_CXX_COMPILER": "${sourceDir}/.pixi/envs/default/bin/g++",
+        "CMAKE_CUDA_COMPILER": "${sourceDir}/.pixi/envs/default/bin/nvcc",
+        "CMAKE_MAKE_PROGRAM": "${sourceDir}/.pixi/envs/default/bin/ninja",
+        "CUDAToolkit_ROOT": "${sourceDir}/.pixi/envs/default",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CUTLASS_NVCC_ARCHS": "90a;90",
+        "CUTLASS_UNITY_BUILD_ENABLED": "ON",
+        "CUTLASS_ENABLE_TESTS": "OFF",
+        "CUTLASS_ENABLE_PROFILER": "ON",
+        "CUTLASS_ENABLE_EXAMPLES": "OFF",
+        "CUTLASS_ENABLE_LIBRARY": "ON"
+      },
+      "environment": {
+        "PATH": "${sourceDir}/.pixi/envs/default/bin:$penv{PATH}",
+        "LD_LIBRARY_PATH": "${sourceDir}/.pixi/envs/default/lib:$penv{LD_LIBRARY_PATH}",
+        "CUDA_HOME": "${sourceDir}/.pixi/envs/default"
+      }
+    },
+    {
+      "name": "hopper-debug",
+      "displayName": "Hopper (Debug)",
+      "description": "Debug build for Hopper architecture with tests enabled",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "${sourceDir}/.pixi/envs/default/bin/gcc",
+        "CMAKE_CXX_COMPILER": "${sourceDir}/.pixi/envs/default/bin/g++",
+        "CMAKE_CUDA_COMPILER": "${sourceDir}/.pixi/envs/default/bin/nvcc",
+        "CMAKE_MAKE_PROGRAM": "${sourceDir}/.pixi/envs/default/bin/ninja",
+        "CUDAToolkit_ROOT": "${sourceDir}/.pixi/envs/default",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CUTLASS_NVCC_ARCHS": "90a;90",
+        "CUTLASS_UNITY_BUILD_ENABLED": "OFF",
+        "CUTLASS_ENABLE_TESTS": "ON",
+        "CUTLASS_ENABLE_PROFILER": "OFF",
+        "CUTLASS_ENABLE_EXAMPLES": "ON",
+        "CUTLASS_ENABLE_LIBRARY": "ON"
+      },
+      "environment": {
+        "PATH": "${sourceDir}/.pixi/envs/default/bin:$penv{PATH}",
+        "LD_LIBRARY_PATH": "${sourceDir}/.pixi/envs/default/lib:$penv{LD_LIBRARY_PATH}",
+        "CUDA_HOME": "${sourceDir}/.pixi/envs/default"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "hopper-release",
+      "displayName": "Hopper (Release)",
+      "configurePreset": "hopper-release",
+      "jobs": 20
+    },
+    {
+      "name": "hopper-debug",
+      "displayName": "Hopper (Debug)",
+      "configurePreset": "hopper-debug",
+      "jobs": 20
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "hopper-release",
+      "displayName": "Hopper (Release)",
+      "configurePreset": "hopper-release",
+      "output": {"outputOnFailure": true}
+    },
+    {
+      "name": "hopper-debug",
+      "displayName": "Hopper (Debug)",
+      "configurePreset": "hopper-debug",
+      "output": {"outputOnFailure": true}
+    }
+  ]
+}

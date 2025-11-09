@@ -1,0 +1,12 @@
+{
+  "cmake.sourceDirectory": "${workspaceFolder}",
+  "cmake.generator": "Ninja",
+  "cmake.useCMakePresets": "always",
+  "cmake.configurePreset": "hopper-release",
+  "cmake.buildPreset": "hopper-release",
+  "cmake.configureOnOpen": false,
+  "cmake.options.statusBarVisibility": "visible",
+  "files.associations": {
+    "*.cuh": "cuda-cpp"
+  }
+}
