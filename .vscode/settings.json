@@ -7,6 +7,14 @@
   "cmake.configureOnOpen": false,
   "cmake.options.statusBarVisibility": "visible",
   "files.associations": {
-    "*.cuh": "cuda-cpp"
+    "*.cu": "cpp",
+    "*.cuh": "cuda-cpp",
+    "cassert": "cpp",
+    "cstdio": "cpp",
+    "iomanip": "cpp",
+    "cstdint": "cpp",
+    "cmath": "cpp",
+    "type_traits": "cpp",
+    "typeindex": "cpp"
   }
 }

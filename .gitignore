@@ -2,3 +2,8 @@
 __pycache__/
 cutlass_library.egg-info/
 /build*
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+.cache/
