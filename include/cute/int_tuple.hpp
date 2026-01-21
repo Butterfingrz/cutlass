@@ -269,7 +269,7 @@ size(IntTuple const& a)
   if constexpr (sizeof...(Is) == 0) {
     return product(a);
   } else {
-    return size(get<Is...>(a));
+    return size(get<Is...>(a));    //! 对 IntTuple 返回 Int<tuple_size>
   }
 
   CUTE_GCC_UNREACHABLE;

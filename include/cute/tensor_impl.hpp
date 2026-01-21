@@ -985,10 +985,13 @@ inner_partition(Tensor    && tensor,
                 Tiler const& tiler,
                 Coord const& coord)
 {
+  //!  返回一个 tiler 为 mode 0 的 Tensor  [rank = 2] (tile_mode, reset_mode) （构造“二层模式”的 tiled 视图）
   auto tensor_tiled = zipped_divide(static_cast<Tensor&&>(tensor), tiler);
+      //!   在编译期拿到 tensor_tiled 的第 0 个 mode（也就是 “tile_mode”）的维数/层级 rank，用来生成后面切片时需要的正确形状的占位坐标
   constexpr int R0 = decltype(rank<0>(tensor_tiled))::value;
 
-  // The coord slices into the second mode (the "rest" mode), flatten the first
+  //* The coord slices into the second mode (the "rest" mode), flatten the first
+  //! 分支：Coord 是 tuple 和 非 tuple
   if constexpr (is_tuple<Coord>::value) {
     // Append trailing modes if coord is tuple
     constexpr int R1 = decltype(rank<1>(tensor_tiled))::value;
@@ -1012,11 +1015,14 @@ outer_partition(Tensor    && tensor,
                 Tiler const& tiler,
                 Coord const& coord)
 {
+  //!  返回一个 tiler 为 mode 0 的 Tensor （构造“二层模式”的 tiled 视图）
   auto tensor_tiled = zipped_divide(static_cast<Tensor&&>(tensor), tiler);
+      //!   
   constexpr int R1 = decltype(rank<1>(tensor_tiled))::value;
-
-  // The coord slices into the first mode (the "tile" mode), flatten the second
-  if constexpr (is_tuple<Coord>::value) {
+  
+  //* The coord slices into the first mode (the "tile" mode), flatten the second
+  //! 分支：Coord 是 tuple 和 非 tuple
+  if constexpr (is_tuple<Coord>::value) {     //!  Coord 是 tuple：用多维坐标去切 rest_mode
     // Append trailing modes if coord is tuple
     constexpr int R0 = decltype(rank<0>(tensor_tiled))::value;
     return tensor_tiled(append<R0>(coord,_), repeat<R1>(_));

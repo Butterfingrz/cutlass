@@ -532,7 +532,7 @@ make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom,
                MMAThrLayout     const& thr_layout   = {},
                Permutations     const& permutations = {})
 {
-  auto thr_layout_mnk  = append<3>(thr_layout, Layout<_1,_0>{});
+  auto thr_layout_mnk  = append<3>(thr_layout, Layout<_1,_0>{});   //! 规范化成恰好 rank=3 的 MNK-layout
   auto permutation_mnk = append<3>(permutations, _);
 
   return TiledMMA<MMA_Atom<MMA_Op>,

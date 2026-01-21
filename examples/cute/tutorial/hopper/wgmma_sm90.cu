@@ -79,7 +79,9 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   static_assert(is_static<ASmemLayout>::value);
   static_assert(is_static<BSmemLayout>::value);
 
-  CUTE_STATIC_ASSERT_V(size<0>(ASmemLayout{}) == size<0>(cta_tiler));  // BLK_M
+  //!  检查 共享内存里 A/B tile 的物理 layout 尺寸 和 CTA 逻辑分块是否一致
+  //!   注：shape/layout 一般是 hierarchical ，这里用 size 通过对应 mode 的 Int<tuple_size> 来进行判断
+  CUTE_STATIC_ASSERT_V(size<0>(ASmemLayout{}) == size<0>(cta_tiler));  // BLK_M   
   CUTE_STATIC_ASSERT_V(size<0>(BSmemLayout{}) == size<1>(cta_tiler));  // BLK_N
   CUTE_STATIC_ASSERT_V(size<1>(ASmemLayout{}) == size<2>(cta_tiler));  // BLK_K
   CUTE_STATIC_ASSERT_V(size<1>(BSmemLayout{}) == size<2>(cta_tiler));  // BLK_K
@@ -97,7 +99,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   Tensor mB = make_tensor(make_gmem_ptr(B), select<1,2>(shape_MNK), dB); // (N,K)
   Tensor mC = make_tensor(make_gmem_ptr(C), select<0,1>(shape_MNK), dC); // (M,N)
 
-  // Get the appropriate blocks for this thread block
+  //! Get the appropriate Tile (blocks) for this thread block
   auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
   Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});  // (BLK_M,BLK_K,k)
   Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
@@ -111,12 +113,14 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), BSmemLayout{}); // (BLK_N,BLK_K,PIPE)
 
   //
-  // Partition the copying of A and B tiles across the threads
+  //! Partition the copying of A and B tiles across the threads
+  //!  for Tiled Copy  
   //
 
   ThrCopy thr_copy_a = copy_a.get_slice(threadIdx.x);
   Tensor tAgA = thr_copy_a.partition_S(gA);                            // (CPY,CPY_M,CPY_K,k)
   Tensor sA_ = as_position_independent_swizzle_tensor(sA);
+  //!  tAsA 代表了传入的 Tiled_copy_A 对象，在 HBM 上 A_Tensor 的线程分片
   Tensor tAsA = thr_copy_a.partition_D(sA_);                           // (CPY,CPY_M,CPY_K,PIPE)
 
   ThrCopy thr_copy_b = copy_b.get_slice(threadIdx.x);
@@ -153,21 +157,28 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   //
   // Define A/B partitioning and C accumulators
   //
-
+  //!  Define A/B partitioning and C accumulators
   ThrMMA thr_mma = mma.get_slice(threadIdx.x);
-  Tensor tCsA = thr_mma.partition_A(sA);                               // (MMA,MMA_M,MMA_K,PIPE)
-  Tensor tCsB = thr_mma.partition_B(sB);                               // (MMA,MMA_N,MMA_K,PIPE)
-  Tensor tCgC = thr_mma.partition_C(gC);                               // (MMA,MMA_M,MMA_N)
+    //! - Converts linear thread index (threadIdx.x) to 4D coordinates: (V, M, N, K)
+    // - V: Thread ID within an MMA atom
+    // - M: Thread's position in M dimension
+    // - N: Thread's position in N dimension
+    // - K: Thread's position in K dimension
+  Tensor tCsA = thr_mma.partition_A(sA);                               //* (MMA,MMA_M,MMA_K,PIPE)
+  Tensor tCsB = thr_mma.partition_B(sB);                               //* (MMA,MMA_N,MMA_K,PIPE)
+  //! tCgC 是累加器值复制到的输出 GMEM 张量的切片
+  Tensor tCgC = thr_mma.partition_C(gC);                               //* (MMA,MMA_M,MMA_N)
 
-  // Allocate registers for pipelining
-  Tensor tCrA = thr_mma.make_fragment_A(tCsA);                         // (MMA,MMA_M,MMA_K,PIPE)
-  Tensor tCrB = thr_mma.make_fragment_B(tCsB);                         // (MMA,MMA_N,MMA_K,PIPE)
+  //!  Allocate registers for pipelining (寄存器中 从SMEM 传递的操作数对应的 fragment)
+  Tensor tCrA = thr_mma.make_fragment_A(tCsA);                         //* (MMA,MMA_M,MMA_K,PIPE)
+  Tensor tCrB = thr_mma.make_fragment_B(tCsB);                         //* (MMA,MMA_N,MMA_K,PIPE)
   // Allocate the accumulators -- same size as the projected data
-  Tensor tCrC = thr_mma.make_fragment_C(tCgC);                         // (MMA,MMA_M,MMA_N)
+  //!  主循环计算过程中保存这些值而创建的寄存器支持张量
+  Tensor tCrC = thr_mma.make_fragment_C(tCgC);                         //* (MMA,MMA_M,MMA_N)
 
-  CUTE_STATIC_ASSERT_V((size<1>(tCgC) == size<1>(tCsA)));              // MMA_M
-  CUTE_STATIC_ASSERT_V((size<2>(tCgC) == size<1>(tCsB)));              // MMA_N
-  CUTE_STATIC_ASSERT_V((size<2>(tCsA) == size<2>(tCsB)));              // MMA_K
+  CUTE_STATIC_ASSERT_V((size<1>(tCgC) == size<1>(tCsA)));              //* MMA_M
+  CUTE_STATIC_ASSERT_V((size<2>(tCgC) == size<1>(tCsB)));              //* MMA_N
+  CUTE_STATIC_ASSERT_V((size<2>(tCsA) == size<2>(tCsB)));              //* MMA_K
 
   // Clear the accumulators
   clear(tCrC);
@@ -217,6 +228,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   //
 
   // Prefetch all but the last
+  //!  在主循环开始前，先填充流水线的前两个 stage
   CUTE_UNROLL
   for (int k = 0; k < K_PIPE_MAX-1; ++k)
   {
@@ -239,21 +251,23 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   // Current pipe to write to
   int k_pipe_write = K_PIPE_MAX-1;
 
+  //!  PIPELINED MAIN LOOP
   CUTE_NO_UNROLL
   for (int k_tile = 0; k_tile < K_TILE_MAX; ++k_tile)
   {
+    //! ============ 第一步：计算下一个要加载的 k_tile ============
     int k_tile_next = k_tile + (K_PIPE_MAX-1);
     k_tile_next = (k_tile_next >= K_TILE_MAX) ? K_TILE_MAX-1 : k_tile_next;
 
     //
     // Copy gmem to smem for k_tile_write
     //
-
+    //! ============ 第二步：异步拷贝下一个 tile 到 smem ============
     copy(copy_a, tAgA(_,_,_,k_tile_next), tAsA(_,_,_,k_pipe_write));
     copy(copy_b, tBgB(_,_,_,k_tile_next), tBsB(_,_,_,k_pipe_write));
     cp_async_fence();
 
-    // Advance k_pipe_write
+    //? Advance k_pipe_write  循环推进写指针
     ++k_pipe_write;
     k_pipe_write = (k_pipe_write == K_PIPE_MAX) ? 0 : k_pipe_write;
 
@@ -262,16 +276,18 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     //
 
     // Wait on all cp.async -- optimize by pipelining to overlap GMEM reads
+    //! ============ 第三步：等待并执行 WGMMA 计算 ============
     cp_async_wait<0>();
 
-    warpgroup_fence_operand(tCrC);
-    warpgroup_arrive();
-    // (V,M,K) x (V,N,K) => (V,M,N)
+    warpgroup_fence_operand(tCrC);   //? 累加器读写栅栏（防止 RAW 冒险）
+    //  MMAs to cover 1 K_TILE
+    warpgroup_arrive();              //? 标记 warpgroup 到达同步点
+    //  (V,M,K) x (V,N,K) => (V,M,N)
     cute::gemm(mma, tCrA(_,_,_,k_pipe_read), tCrB(_,_,_,k_pipe_read), tCrC);
-    warpgroup_commit_batch();
-    /// Wait on the GMMA barrier for K_PIPE_MMAS (or fewer) outstanding to ensure smem_pipe_write is consumed
-    warpgroup_wait<0>();
-    warpgroup_fence_operand(tCrC);
+    warpgroup_commit_batch();        //? 提交 WGMMA 批次
+    //   Wait on the GMMA barrier for K_PIPE_MMAS (or fewer) outstanding to ensure smem_pipe_write is consumed
+    warpgroup_wait<0>();             //? 等待 WGMMA 完成
+    warpgroup_fence_operand(tCrC);   //? 再次栅栏保护累加器
 
     // Advance k_pipe_read
     ++k_pipe_read;
@@ -314,10 +330,12 @@ gemm_nt(int m, int n, int k,
   auto bM = Int<128>{};
   auto bN = Int<128>{};
   auto bK = Int< 64>{};
+  //!  Define CTA Tiler shape
   auto cta_tiler = make_shape(bM, bN, bK);                   // (BLK_M, BLK_N, BLK_K)
   auto bP = Int<3>{};  // Pipeline
 
-  // Define the smem layouts (static)
+  //!  Define the smem layouts (static)
+  //!  注： 如果修改了  BLK_M/BLK_N/BLK_K 需要同步 tile_to_shape
   auto sA = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TA>{}, make_shape(bM,bK,bP));
   auto sB = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TB>{}, make_shape(bN,bK,bP));
 
@@ -348,7 +366,7 @@ gemm_nt(int m, int n, int k,
   //
 
   // Launch parameter setup
-  dim3 dimBlock(size(tiled_mma));
+  dim3 dimBlock(size(tiled_mma));   //!  通过 TiledMMA 对象的 size 方法获取参与该 MMA 操作的线程数量
   dim3 dimCluster(1, 1, 1);
   dim3 dimGrid(round_up(size(ceil_div(m, bM)), dimCluster.x),
                round_up(size(ceil_div(n, bN)), dimCluster.y));
@@ -410,6 +428,7 @@ gemm_tn(int m, int n, int k,
   auto bP = Int<3>{};  // Pipeline
 
   // Define the smem layouts (static)
+  //!  获取一个布局（同名图块）并将其复制以覆盖更大的形状
   auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<TA>{}, make_shape(bM,bK,bP));
   auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<TB>{}, make_shape(bN,bK,bP));
 

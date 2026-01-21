@@ -220,9 +220,10 @@ class MbarrierArray(SyncObject):
                     loc=loc,
                     ip=ip,
                 )
-
+        #! 把 mbarrier 初始化限定在每个 CTA 的 warp 0 进行
+        #! 目的：按照 warp 为单位进行控制，避免 warp divergent
         warp_idx = cute.arch.warp_idx(loc=loc, ip=ip)
-        warp_idx = cute.arch.make_warp_uniform(warp_idx, loc=loc, ip=ip)
+        warp_idx = cute.arch.make_warp_uniform(warp_idx, loc=loc, ip=ip)   #!  在 CuTeDSL 里会插入一个 cute_nvgpu 方言的 op：arch_make_warp_uniform，语义是“把这个 i32 值标记为 warp 内不变
 
         if_generate(warp_idx == 0, then_body, loc=loc, ip=ip)
 

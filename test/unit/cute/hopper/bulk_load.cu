@@ -50,7 +50,7 @@ struct SharedStorage {
   cute::uint64_t bulk_copy_mbar[1];
 };
 
-#if CUDA_12_0_SM90_FEATURES_SUPPORTED
+//#if CUDA_12_0_SM90_FEATURES_SUPPORTED
 template <class T, class GmemLayout, class SmemLayout>
 __global__ void
 bulk_copy_test_device_cute(T const* g_in,

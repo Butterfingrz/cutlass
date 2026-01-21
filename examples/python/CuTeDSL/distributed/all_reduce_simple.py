@@ -44,7 +44,7 @@ import cutlass.cute.testing as testing
 from cutlass.cute.runtime import from_dlpack
 
 try:
-    import nvshmem.core
+    import nvshmem.core    #! nvshmem.core
 except ImportError as exc:
     raise ImportError(
         "nvshmem4py is required but not installed. Please install it using:\n"
@@ -177,9 +177,10 @@ def run_all_reduce_simple(
         print("\nRunning Elementwise Add test with:")
         print(f"Tensor dimensions: [{M}, {N}]")
         print(f"GPU count: {world_size}")
-
+    #! NVSHMEM-backed 对称内存分配
     local_tensor = nvshmem.core.tensor((M, N), dtype=torch.float32)
     local_tensor.random_(0, 100)
+    
     tensor_list = [nvshmem.core.get_peer_tensor(local_tensor, rank) for rank in range(world_size)]
     output = torch.zeros((M, N), device=f"cuda:{rank}")
     

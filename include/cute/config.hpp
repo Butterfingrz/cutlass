@@ -123,7 +123,7 @@
 #define CUTE_STATIC_V(x)            decltype(x)::value
 
 #define CUTE_STATIC_ASSERT          static_assert
-#define CUTE_STATIC_ASSERT_V(x,...) static_assert(decltype(x)::value, ##__VA_ARGS__)
+#define CUTE_STATIC_ASSERT_V(x,...) static_assert(decltype(x)::value, ##__VA_ARGS__)   //! 对**类型里携带的编译期常量 ::value**做 static_assert
 
 // Fail and print a message. Typically used for notification of a compiler misconfiguration.
 #if defined(__CUDA_ARCH__)

@@ -71,7 +71,7 @@ struct TV_Tiler
     // If Layout_TV and Tiler_MN were composable in general, then this won't be needed!
 
     // ((thr_id,val_id),(RestM,RestN,...))
-    return zipped_divide(tensor, Tiler_MN{}).compose(TiledLayout_TV{}, _);
+    return zipped_divide(tensor, Tiler_MN{}).compose(TiledLayout_TV{}, _);   //! zipped_devided
   }
 
   template <class SliceCoord>
