@@ -35,4 +35,12 @@ cutlass_example_add_executable(
   TEST_PREFETCH_CASE
 )
 
+# This example requires C++20 for class types as non-type template parameters
+set_target_properties(63_hopper_gemm_with_weight_prefetch PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CUDA_STANDARD 20
+  CUDA_STANDARD_REQUIRED ON
+)
+
 target_include_directories(63_hopper_gemm_with_weight_prefetch PUBLIC .)
