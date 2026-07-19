@@ -1,35 +1,52 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Use of this software is governed by the terms and conditions of the
 # NVIDIA End User License Agreement (EULA), available at:
-# https://docs.nvidia.com/cutlass/media/docs/pythonDSL/license.html
+# https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/license.html
 #
 # Any use, reproduction, disclosure, or distribution of this software
 # and related documentation outside the scope permitted by the EULA
 # is strictly prohibited.
 
+
+from collections.abc import Iterable
 from functools import partial, reduce
+import inspect
 from inspect import isclass
-from typing import Any, Dict, List, Optional, Tuple, Type, Union, overload
+import warnings
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+    cast,
+    overload,
+)
 
 from typing_extensions import deprecated
 
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import builtin, llvm
-from cutlass._mlir.dialects import cute as _cute_ir
-from cutlass._mlir.dialects.cute import (
-    Ratio as _Ratio,
-)
+from cutlass._mlir.dialects import builtin, llvm, vector, arith
+from cutlass._mlir.dialects import cute as _cute_ir, cute_nvgpu as _cute_nvgpu_ir
 from cutlass._mlir.dialects.cute import (
     ReductionOp as ReductionOp,
 )
 from cutlass._mlir.dialects.cute import (
+    Ratio as _Ratio,
     ScaledBasis as _ScaledBasis,
+    SparseElemType as _SparseElemType,
 )
+from cutlass._mlir.extras.types import MemRefType as BuiltinMemRefType
 from cutlass.cutlass_dsl import (
     T,
     const,
+    and_,
+    as_numeric,
     cutlass_arith,
     dsl_user_op,
     extract_mlir_values,
@@ -37,10 +54,11 @@ from cutlass.cutlass_dsl import (
     lru_cache_ir,
     not_,
 )
+from cutlass.base_dsl.typing import Int8 as _BaseInt8
+from cutlass.base_dsl.typing import Pointer as _BasePointer
 
-from .tuple import find_if, flatten_to_tuple, product_each, transform_leaf, wrap
+from .tuple import find_if, flatten_to_tuple, product_each, transform_leaf, unwrap, wrap
 from .typing import (
-    AddressSpace,
     Boolean,
     ComposedLayout,
     Coord,
@@ -61,9 +79,101 @@ from .typing import (
     Tile,
     Tiler,
     XTuple,
+    _element_precision_width,
+    _as_address_space,
+    _to_mlir_address_space,
     is_int_tuple,
     is_integer,
+    AddressSpace,
 )
+
+
+__all__ = [
+    # Classes
+    "IntValue",
+    "Swizzle",
+    "struct",
+    # Utility functions
+    "E",
+    "get_divisibility",
+    "is_valid_leaf",
+    "is_static",
+    "has_underscore",
+    "has_scaled_basis",
+    "pretty_str",
+    "printf",
+    # Layout operations
+    "front",
+    "is_major",
+    "assume",
+    "make_swizzle",
+    "static",
+    "get_leaves",
+    "depth",
+    "rank",
+    "is_congruent",
+    "is_weakly_congruent",
+    "get",
+    "select",
+    "group_modes",
+    "slice_",
+    "dice",
+    "prepend",
+    "append",
+    "prepend_ones",
+    "append_ones",
+    "repeat_as_tuple",
+    "repeat",
+    "repeat_like",
+    "flatten",
+    "filter_zeros",
+    "filter",
+    "size",
+    "shape_div",
+    "ceil_div",
+    "round_up",
+    "make_layout",
+    "make_identity_layout",
+    "make_ordered_layout",
+    "make_layout_like",
+    "make_composed_layout",
+    "cosize",
+    "size_in_bytes",
+    "coalesce",
+    "crd2idx",
+    "idx2crd",
+    "increment_coord",
+    "recast_layout",
+    "slice_and_offset",
+    "shape",
+    "recast_ptr",
+    "make_ptr",
+    "composition",
+    "complement",
+    "right_inverse",
+    "left_inverse",
+    "logical_product",
+    "zipped_product",
+    "tiled_product",
+    "flat_product",
+    "raked_product",
+    "blocked_product",
+    "logical_divide",
+    "zipped_divide",
+    "tiled_divide",
+    "flat_divide",
+    "max_common_layout",
+    "max_common_vector",
+    "tile_to_shape",
+    "local_partition",
+    "local_tile",
+    "make_layout_image_mask",
+    "leading_dim",
+    "make_layout_tv",
+    "get_nonswizzle_portion",
+    "get_swizzle_portion",
+    "nullspace",
+]
 
 ####################################################################################################
 #
@@ -72,7 +182,7 @@ from .typing import (
 ####################################################################################################
 
 
-def _get_typed_value(x):
+def _get_typed_value(x: Any) -> Any:
     if isinstance(x, Integer):
         x = x.ir_value()
 
@@ -82,7 +192,14 @@ def _get_typed_value(x):
         return x
 
 
-def _pack_x(x, packer, op, *, loc=None, ip=None) -> ir.Value:
+def _pack_x(
+    x: Any,
+    packer: Callable[..., Any],
+    op: Any,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> ir.Value:
     x = transform_leaf(_get_typed_value, x)
     res_ty, dyn_elems = packer(x)
     # <"0"> is deduced from type inference which should be removed for make_... operations
@@ -90,12 +207,22 @@ def _pack_x(x, packer, op, *, loc=None, ip=None) -> ir.Value:
     return op(res_ty, dyn_elems, loc=loc, ip=ip).result
 
 
-def _pack_shape(shape: Shape, *, loc=None, ip=None) -> ir.Value:
+def _pack_shape(
+    shape: Shape,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> ir.Value:
     _check_shape(shape)
     return _pack_x(shape, _cute_ir.pack_shape, _cute_ir.MakeShapeOp, loc=loc, ip=ip)
 
 
-def _pack_stride(stride: Stride, *, loc=None, ip=None) -> ir.Value:
+def _pack_stride(
+    stride: Stride,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> ir.Value:
     _check_stride(stride)
     dyn_elems = map(_get_typed_value, extract_mlir_values(stride))
     # Convert basis elements to the base class before _pack_x
@@ -111,27 +238,42 @@ def _pack_stride(stride: Stride, *, loc=None, ip=None) -> ir.Value:
     return _cute_ir.MakeStrideOp(res_ty, dyn_elems, loc=loc, ip=ip).result
 
 
-def _pack_coord(coord: Coord, *, loc=None, ip=None) -> ir.Value:
+def _pack_coord(
+    coord: Coord,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> ir.Value:
     _check_coord(coord)
     return _pack_x(coord, _cute_ir.pack_coord, _cute_ir.MakeCoordOp, loc=loc, ip=ip)
 
 
-def _pack_int_tuple(int_tuple: IntTuple, *, loc=None, ip=None) -> ir.Value:
+def _pack_int_tuple(
+    int_tuple: IntTuple,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> ir.Value:
     _check_int_tuple(int_tuple)
     return _pack_x(
         int_tuple, _cute_ir.pack_int_tuple, _cute_ir.MakeIntTupleOp, loc=loc, ip=ip
     )
 
 
-def _pack_tile(tile: Tile, *, loc=None, ip=None) -> ir.Value:
+def _pack_tile(
+    tile: Tile,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> ir.Value:
     _check_tile(tile)
 
-    def expand_leaves(tile) -> list:
+    def expand_leaves(tile: Any) -> list:
         leaves = []
         for e in tile:
             if isinstance(e, _Layout):
-                leaves.extend(list(flatten_to_tuple(e.shape)))
-                leaves.extend(list(flatten_to_tuple(e.stride)))
+                leaves.extend(list(flatten_to_tuple(e.shape_method(loc=loc, ip=ip))))
+                leaves.extend(list(flatten_to_tuple(e.stride_method(loc=loc, ip=ip))))
             else:
                 leaves.append(e)
         return leaves
@@ -142,11 +284,17 @@ def _pack_tile(tile: Tile, *, loc=None, ip=None) -> ir.Value:
         _get_typed_value(x) for x in dyn_elems if isinstance(x, (Integer, ir.Value))
     ]
 
+    tile = transform_leaf(_get_typed_value, tile)
     res_ty = _cute_ir.pack_tile(tile)
     return _cute_ir.make_tile(res_ty, dyn_elems, loc=loc, ip=ip)
 
 
-def _unpack_x_tuple(t: Union[ir.Type, ir.Value], *, loc=None, ip=None) -> XTuple:
+def _unpack_x_tuple(
+    t: Union[ir.Type, ir.Value],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> XTuple:
     # If t is an MLIR type, make sure it's static and make a Value
     if isinstance(t, ir.Type):
         if not _cute_ir.is_static(t):
@@ -160,7 +308,7 @@ def _unpack_x_tuple(t: Union[ir.Type, ir.Value], *, loc=None, ip=None) -> XTuple
             vals = []
         else:
             vals = get_leaves(t, loc=loc, ip=ip)
-            if not isinstance(vals, list):
+            if not isinstance(vals, ir.OpResultList):
                 vals = [vals]
     else:
         raise TypeError(f"expects static type or value, but got {t}")
@@ -168,7 +316,7 @@ def _unpack_x_tuple(t: Union[ir.Type, ir.Value], *, loc=None, ip=None) -> XTuple
     # CuTe IR only supports Int32 for now. Need to support detection of other types
     res = _cute_ir.unpack_x_tuple(input_ty, vals, loc=loc)
 
-    def post_process(x):
+    def post_process(x: Any) -> Any:
         if isinstance(x, _cute_ir.ScaledBasis):
             return ScaledBasis(post_process(x.get_value()), x.get_mode())
         elif isinstance(x, _cute_ir.Ratio):
@@ -269,7 +417,14 @@ class IntValue(cutlass_arith.ArithValue):
     """
 
     @dsl_user_op
-    def __init__(self, v, signed=True, *, loc=None, ip=None):
+    def __init__(
+        self,
+        v: Any,
+        signed: bool = True,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> None:
         # Cute Constrained Int Type is always signed
         if isinstance(v, int):
             v = _pack_int_tuple(v, loc=loc, ip=ip)
@@ -281,11 +436,22 @@ class IntValue(cutlass_arith.ArithValue):
             super().__init__(v, True, loc=loc, ip=ip)
 
     @dsl_user_op
-    def get_typed_value(self, *, loc=None, ip=None):
+    def get_typed_value(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> ir.Value:
         if isinstance(self.type, ir.IntegerType):
-            def_op = self.owner.operation
-            if def_op.name == "cute.get_scalars":
-                return def_op.operands[0]
+            # A block argument (e.g. a kernel parameter, such as the scalar
+            # divisor a FastDivmodDivisorV2 carries across the kernel boundary)
+            # is owned by an ir.Block, not an ir.Operation, so it has no
+            # defining op and no cute.get_scalars shortcut. Fall through to
+            # wrap it as an int_tuple in that case.
+            if not isinstance(self.owner, ir.Block):
+                def_op = self.owner.operation
+                if def_op.name == "cute.get_scalars":
+                    return def_op.operands[0]
 
         assert not isinstance(self.type, _cute_ir.IntTupleType)
 
@@ -295,27 +461,29 @@ class IntValue(cutlass_arith.ArithValue):
         return _cute_ir.MakeIntTupleOp(res_ty, [self], loc=loc, ip=ip).result
 
     @property
-    def divisibility(self):
-        assert isinstance(
-            self.get_typed_value().type, _cute_ir.IntTupleType
-        ), f"expected self.get_typed_value() to be int_tuple type, but got {self.get_typed_value().type}"
-        return self.get_typed_value().type.get_divisibility([0])
+    def divisibility(self) -> int:
+        typed_value = self.get_typed_value()
+        assert isinstance(typed_value.type, _cute_ir.IntTupleType), (
+            f"expected self.get_typed_value() to be int_tuple type, but got {typed_value.type}"
+        )
+        return typed_value.type.get_divisibility([0])
 
-    def __str__(self):
+    def __str__(self) -> str:
         if self.divisibility == 1:
             return "?"
-        else:
+        elif self.type.width == 32:
             return f"?{{div={self.divisibility}}}"
-
-    def __repr__(self):
+        else:
+            return f"?{{i{self.type.width} div={self.divisibility}}}"
+    def __repr__(self) -> str:
         parent_name = cutlass_arith.ArithValue.__name__
         return super().__str__().replace(parent_name, IntValue.__name__)
 
-    def pretty_str(self):
+    def pretty_str(self) -> str:
         return self.__str__()
 
-    def _binary_op(op):
-        def wrapper(self, other, **kwargs):
+    def _binary_op(op: Any) -> Any:
+        def wrapper(self: "IntValue", other: Any, **kwargs: Any) -> "IntValue":
             if isinstance(other, IntValue):
                 other_val = other.get_typed_value()
             elif isinstance(other, ir.Value) and isinstance(
@@ -330,76 +498,140 @@ class IntValue(cutlass_arith.ArithValue):
                 # Dispatch to `__rmul__` of `other`
                 return NotImplemented
 
-            return IntValue(op(self, other_val, **kwargs))
+            return IntValue(
+                op(self, other_val, **kwargs),
+                loc=kwargs.get("loc"),
+                ip=kwargs.get("ip"),
+            )
 
         return wrapper
 
     @dsl_user_op
     @_binary_op
-    def __add__(self, other, *, loc=None, ip=None):
-        return _cute_ir.add_offset(
+    def __add__(
+        self,
+        other: Any,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> "IntValue":
+        return _cute_ir.tuple_add(
             self.get_typed_value(loc=loc, ip=ip), other, loc=loc, ip=ip
         )
 
     @dsl_user_op
     @_binary_op
-    def __sub__(self, other, *, loc=None, ip=None):
+    def __sub__(
+        self,
+        other: Any,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> "IntValue":
         return _cute_ir.tuple_sub(
             self.get_typed_value(loc=loc, ip=ip), other, loc=loc, ip=ip
         )
 
     @dsl_user_op
     @_binary_op
-    def __mul__(self, other, *, loc=None, ip=None):
+    def __mul__(
+        self,
+        other: Any,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> "IntValue":
         return _cute_ir.tuple_mul(
             self.get_typed_value(loc=loc, ip=ip), other, loc=loc, ip=ip
         )
 
     @dsl_user_op
     @_binary_op
-    def __floordiv__(self, other, *, loc=None, ip=None) -> "IntValue":
+    def __floordiv__(
+        self,
+        other: Any,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> "IntValue":
         return _cute_ir.tuple_div(
             self.get_typed_value(loc=loc, ip=ip), other, loc=loc, ip=ip
         )
 
     @dsl_user_op
     @_binary_op
-    def __mod__(self, other, *, loc=None, ip=None) -> cutlass_arith.ArithValue:
+    def __mod__(
+        self,
+        other: Any,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> "IntValue":
         return _cute_ir.tuple_mod(
             self.get_typed_value(loc=loc, ip=ip), other, loc=loc, ip=ip
         )
 
     @dsl_user_op
     @_binary_op
-    def __radd__(self, other, *, loc=None, ip=None) -> "IntValue":
-        return _cute_ir.add_offset(
+    def __radd__(
+        self,
+        other: Any,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> "IntValue":
+        return _cute_ir.tuple_add(
             other, self.get_typed_value(loc=loc, ip=ip), loc=loc, ip=ip
         )
 
     @dsl_user_op
     @_binary_op
-    def __rsub__(self, other, *, loc=None, ip=None) -> "IntValue":
+    def __rsub__(
+        self,
+        other: Any,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> "IntValue":
         return _cute_ir.tuple_sub(
             other, self.get_typed_value(loc=loc, ip=ip), loc=loc, ip=ip
         )
 
     @dsl_user_op
     @_binary_op
-    def __rmul__(self, other, *, loc=None, ip=None):
+    def __rmul__(
+        self,
+        other: Any,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> "IntValue":
         return _cute_ir.tuple_mul(
             other, self.get_typed_value(loc=loc, ip=ip), loc=loc, ip=ip
         )
 
     @dsl_user_op
     @_binary_op
-    def __rfloordiv__(self, other, *, loc=None, ip=None) -> "IntValue":
+    def __rfloordiv__(
+        self,
+        other: Any,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> "IntValue":
         return _cute_ir.tuple_div(
             other, self.get_typed_value(loc=loc, ip=ip), loc=loc, ip=ip
         )
 
     @dsl_user_op
     @_binary_op
-    def __rmod__(self, other, *, loc=None, ip=None) -> "IntValue":
+    def __rmod__(
+        self,
+        other: Any,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> "IntValue":
         return _cute_ir.tuple_mod(
             other, self.get_typed_value(loc=loc, ip=ip), loc=loc, ip=ip
         )
@@ -443,7 +675,7 @@ class Ratio(_Ratio):
         res = super().reduced()
         return Ratio(res.numerator, res.denominator)
 
-    def __mul__(self, other):
+    def __mul__(self, other: Union["Ratio", int]) -> "Ratio":
         """Multiply this ratio by another ratio or an integer.
 
         :param other: The value to multiply by
@@ -462,7 +694,7 @@ class Ratio(_Ratio):
         else:
             raise TypeError(f"Cannot multiply Ratio with {type(other)}")
 
-    def __rmul__(self, other):
+    def __rmul__(self, other: Union["Ratio", int]) -> "Ratio":
         """Right multiplication operation.
 
         :param other: The value to multiply by
@@ -472,7 +704,7 @@ class Ratio(_Ratio):
         """
         return self.__mul__(other)
 
-    def __str__(self):
+    def __str__(self) -> str:
         """String representation of the ratio.
 
         :return: String in the format "numerator/denominator"
@@ -480,7 +712,7 @@ class Ratio(_Ratio):
         """
         return super().__str__()
 
-    def to(self, dtype):
+    def to(self, dtype: type) -> ir.Value:
         """Convert the ratio to another type.
 
         :param dtype: The target type for conversion
@@ -537,7 +769,7 @@ class ScaledBasis:
         idx = crd2idx(coord, layout)  # Maps (2, 3) to (4, 3)
     """
 
-    def __init__(self, value, mode) -> None:
+    def __init__(self, value: Any, mode: Union[int, List[int]]) -> None:
         if isinstance(mode, int):
             self._mode = [mode]
         else:
@@ -556,7 +788,13 @@ class ScaledBasis:
         return not is_dynamic_expression(self._value)
 
     @dsl_user_op
-    def to(self, dtype, *, loc=None, ip=None):
+    def to(
+        self,
+        dtype: type,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Any:
         """Convert to another type.
 
         :param dtype: The target type for conversion
@@ -577,20 +815,23 @@ class ScaledBasis:
             if isinstance(self._value, Integer):
                 scale = self._value.ir_value(loc=loc, ip=ip)
                 return _ScaledBasis(scale, self._mode, get_divisibility(scale))
+            elif isinstance(self._value, cutlass_arith.ArithValue):
+                scale = self._value
+                return _ScaledBasis(scale, self._mode, get_divisibility(scale))
             else:
                 scale = self._value
                 return _ScaledBasis(scale, self._mode)
         else:
             raise TypeError(f"Cannot convert ScaledBasis to {dtype}")
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{self.to(_ScaledBasis).__str__()}"
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash((self.value, tuple(self.mode)))
 
     @property
-    def value(self):
+    def value(self) -> Any:
         """Get the scale value.
 
         :return: The scale value
@@ -606,14 +847,18 @@ class ScaledBasis:
         """
         return self._mode
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if isinstance(other, ScaledBasis):
-            return self.value == other.value and self.mode == other.mode
+            return and_(self.mode == other.mode, self.value == other.value)  # type: ignore[return-value]
         else:
             return False
 
     def __rmul__(
-        self, scale: Union[Int, ir.Value, Ratio], *, loc=None, ip=None
+        self,
+        scale: Union[Int, ir.Value, Ratio],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
     ) -> "ScaledBasis":
         """Right multiplication by a scale factor.
 
@@ -635,12 +880,13 @@ class ScaledBasis:
             raise TypeError(
                 f"scale must be an integer or a ratio, but got {type(scale)}"
             )
-        if isinstance(self.value, Ratio):
+
+        value = self.value
+
+        if isinstance(value, Ratio):
             raise NotImplementedError(
                 "scaling a basis element having a ratio is not supported"
             )
-
-        value = self.value
 
         if not isinstance(value, (Integer, Ratio, int, cutlass_arith.ArithValue)):
             raise TypeError(f"Don't support {type(value)} for ScaledBasis")
@@ -654,9 +900,34 @@ class ScaledBasis:
         elif isinstance(value, Integer):
             value = value.ir_value(loc=loc, ip=ip)
 
-        return ScaledBasis(scale * value, self.mode)  # type: ignore
+        return ScaledBasis(scale * value, self.mode)
 
-    def __extract_mlir_values__(self):
+    def __mul__(
+        self,
+        scale: Union[Int, ir.Value, Ratio],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> "ScaledBasis":
+        """Multiplication by a scale factor.
+        This operation is used in layout algebra to scale basis elements,
+        which is essential for operations like composition and partitioning.
+
+        :param scale: The scale factor
+        :type scale: Union[Int, ir.Value, Ratio]
+        :param loc: The source location for the operation, defaults to None
+        :type loc: Location, optional
+        :param ip: The insertion point for the operation, defaults to None
+        :type ip: InsertionPoint, optional
+        :return: A new scaled basis element
+        :rtype: ScaledBasis
+        :raises TypeError: If scale is not of a supported type
+        :raises NotImplementedError: If scaling a basis element with a ratio value
+        """
+
+        return self.__rmul__(scale, loc=loc, ip=ip)  # type: ignore[call-arg]
+
+    def __extract_mlir_values__(self) -> List[ir.Value]:
         if isinstance(self.value, Ratio):
             # Ratio is always static
             return []
@@ -664,7 +935,7 @@ class ScaledBasis:
             return extract_mlir_values(self.value)
 
 
-def E(mode: Union[int, List[int]]) -> ScaledBasis:
+def E(mode: Union[int, List[int]]) -> Union[ScaledBasis, int]:
     """Create a unit ScaledBasis element with the specified mode.
 
     This function creates a ScaledBasis with value 1 and the given mode.
@@ -701,17 +972,90 @@ def E(mode: Union[int, List[int]]) -> ScaledBasis:
     return ScaledBasis(1, mode)
 
 
-def get_divisibility(x: Union[int, Integer]) -> int:
+def get_divisibility(x: Int) -> int:
     if isinstance(x, int):
         return x
 
     if isinstance(x, Integer):
-        x = x.value
+        x = x.value  # type: ignore[assignment]
 
     if isinstance(x, IntValue):
         return x.divisibility
     else:
         return 1
+
+
+def basis_value(e: Union[ScaledBasis, Any]) -> Union[Int, ir.Value, Ratio]:
+    """Extract the value from a ScaledBasis or return the input as-is.
+
+    If the input is a ScaledBasis, returns its value component.
+    Otherwise, returns the input unchanged.
+
+    :param e: The input element (ScaledBasis or any other type)
+    :type e: Any
+    :return: The value of the ScaledBasis or the input itself
+    :rtype: Any
+
+    **Examples:**
+
+    .. code-block:: python
+
+        >>> basis_value(ScaledBasis(5, 0))
+        5
+        >>> basis_value(42)
+        42
+    """
+    if isinstance(e, ScaledBasis):
+        return e.value
+    else:
+        return e
+
+
+@dsl_user_op
+def basis_get(
+    basis: Union[ScaledBasis, Numeric, int],
+    t: Union[XTuple, Layout, ComposedLayout],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[XTuple, Layout, ComposedLayout]:
+    """Apply the mode indices from a ScaledBasis to get an element from a tuple, layout, or composed layout.
+
+    If the basis is a ScaledBasis or Numeric with mode indices, this function uses those
+    indices to extract the corresponding element from the tuple using hierarchical
+    indexing. If the basis is not a ScaledBasis or has no modes, returns the tuple, layout, or composed layout as-is.
+
+    :param basis: The basis element (ScaledBasis)
+    :type basis: ScaledBasis
+    :param t: The tuple, layout, or composed layout to index into
+    :type t: Union[XTuple, Layout, ComposedLayout]
+    :return: The element at the position specified by the basis modes, or t itself
+    :rtype: Union[XTuple, Layout, ComposedLayout]
+
+    **Examples:**
+
+    .. code-block:: python
+
+        >>> basis_get(ScaledBasis(2, 1), (10, 20, 30))
+        20
+        >>> basis_get(ScaledBasis(2, [0, 1]), ((10, 20), (30, 40)))
+        20
+        >>> basis_get(5, (10, 20, 30))  # Non-basis returns tuple as-is
+        (10, 20, 30)
+    """
+    if isinstance(basis, ScaledBasis):
+        modes = basis.mode
+        if len(modes) == 0:
+            return t
+        else:
+            # Use hierarchical indexing with the mode list
+            return get(t, modes, loc=loc, ip=ip)
+    elif isinstance(basis, (Numeric, int)):
+        return t
+    else:
+        raise TypeError(
+            f"basis must be a ScaledBasis or Numeric, but got {type(basis)}"
+        )
 
 
 @ir.register_value_caster(_cute_ir.SwizzleType.get_static_typeid(), replace=True)
@@ -745,9 +1089,44 @@ class Swizzle(ir.Value):
 
     """
 
-    def __str__(self):
+    def __str__(self) -> str:
         # Cut off the MLIR type's string for making pretty_str more concise
         return self.type.__str__()[15 : 15 + 8]
+
+    def __eq__(self, other: object) -> Union[bool, Boolean]:  # type: ignore[override]
+        """Check if this Swizzle is equal to another Swizzle. Since num_bits, num_base, and num_shift are static,
+        this is a constant expression.
+
+        Two Swizzles are equal if they have the same num_bits, num_base, and num_shift.
+
+        :param other: The Swizzle to compare with.
+        :return: True if Swizzles are equal, False otherwise.
+        """
+        if isinstance(other, Swizzle):
+            return self.type == other.type
+        else:
+            return False
+
+    @property
+    def num_bits(self) -> int:
+        """
+        Returns the number of bits in the mask (B in Sw<B,M,S>).
+        """
+        return self.type.num_bits
+
+    @property
+    def num_base(self) -> int:
+        """
+        Returns the number of least-significant bits to keep constant (M in Sw<B,M,S>).
+        """
+        return self.type.num_base
+
+    @property
+    def num_shift(self) -> int:
+        """
+        Returns the distance to shift the mask (S in Sw<B,M,S>).
+        """
+        return self.type.num_shift
 
 
 @ir.register_value_caster(_cute_ir.LayoutType.get_static_typeid(), replace=True)
@@ -785,24 +1164,63 @@ class _Layout(Layout):
         idx = cute.crd2idx((2, 3), layout)
     """
 
-    def __init__(self, op_result) -> None:
+    def __init__(self, op_result: ir.Value) -> None:
         """Initialize a Layout object.
 
         :param op_result: The operation result value to wrap.
         """
         super().__init__(op_result)
 
-    def __str__(self) -> str:
+    def __repr__(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> str:
+        return self.__str__(loc=loc, ip=ip)  # type: ignore[call-arg]
+
+    def __str__(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> str:
         """Return a string representation of the layout.
 
         :return: A string in the format "shape:stride".
         """
-        return f"{pretty_str(self.shape)}:{pretty_str(self.stride)}"
+        type_str = self.type.__str__()
+        return type_str[type_str.find("<") + 2 : type_str.rfind(">") - 1]
+
+    @lru_cache_ir()
+    def shape_method(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Shape:
+        return _unpack_x_tuple(_cute_ir.get_shape(self, loc=loc, ip=ip), loc=loc, ip=ip)
+
+    @lru_cache_ir()
+    def stride_method(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Stride:
+        return _unpack_x_tuple(
+            _cute_ir.get_stride(self, loc=loc, ip=ip), loc=loc, ip=ip
+        )
 
     @property
     @dsl_user_op
     @lru_cache_ir()
-    def shape(self, *, loc=None, ip=None) -> Shape:
+    def shape(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Shape:
         """Get the shape of the layout.
 
         The shape defines the dimensions and structure of the layout's
@@ -810,21 +1228,24 @@ class _Layout(Layout):
 
         :return: The hierarchical shape of the layout.
         """
-        return _unpack_x_tuple(_cute_ir.get_shape(self, loc=loc, ip=ip), loc=loc, ip=ip)
+        return self.shape_method(loc=loc, ip=ip)
 
     @property
     @dsl_user_op
     @lru_cache_ir()
-    def stride(self, *, loc=None, ip=None) -> Stride:
+    def stride(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Stride:
         """Get the stride of the layout.
 
         The stride defines how coordinates map to linear indices in memory.
 
         :return: The hierarchical stride of the layout.
         """
-        return _unpack_x_tuple(
-            _cute_ir.get_stride(self, loc=loc, ip=ip), loc=loc, ip=ip
-        )
+        return self.stride_method(loc=loc, ip=ip)
 
     @property
     def max_alignment(self) -> int:
@@ -834,7 +1255,7 @@ class _Layout(Layout):
         """
         return self.type.max_alignment
 
-    def __eq__(self, other) -> Union[bool, Boolean]:
+    def __eq__(self, other: object) -> Union[bool, Boolean]:  # type: ignore[override]
         """Check if this layout is equal to another layout.
 
         Two layouts are equal if they have the same shape and stride.
@@ -850,7 +1271,7 @@ class _Layout(Layout):
         else:
             return False
 
-    def __req__(self, other) -> Union[bool, Boolean]:
+    def __req__(self, other: object) -> Union[bool, Boolean]:
         """Reflected equality check.
 
         :param other: The layout to compare with.
@@ -860,7 +1281,7 @@ class _Layout(Layout):
             return other.__eq__(self)
         return False
 
-    def __ne__(self, other) -> Union[bool, Boolean]:
+    def __ne__(self, other: object) -> Union[bool, Boolean]:  # type: ignore[override]
         """Check if this layout is not equal to another layout.
 
         :param other: The layout to compare with.
@@ -873,7 +1294,7 @@ class _Layout(Layout):
         else:
             return True
 
-    def __rne__(self, other) -> Union[bool, Boolean]:
+    def __rne__(self, other: object) -> Union[bool, Boolean]:
         """Reflected inequality check.
 
         :param other: The layout to compare with.
@@ -890,7 +1311,12 @@ class _Layout(Layout):
         return get(self, mode=[idx])
 
     @dsl_user_op
-    def __call__(self, coord: Coord, loc=None, ip=None) -> IntTuple:
+    def __call__(
+        self,
+        coord: Coord,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> IntTuple:
         if has_underscore(coord):
             crd_val = _pack_coord(coord, loc=loc, ip=ip)
             return _cute_ir.slice(self, crd_val, loc=loc, ip=ip)
@@ -898,7 +1324,13 @@ class _Layout(Layout):
             return crd2idx(coord, self, loc=loc, ip=ip)
 
     @dsl_user_op
-    def get_hier_coord(self, idx, *, loc=None, ip=None) -> Coord:
+    def get_hier_coord(
+        self,
+        idx: Int,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Coord:
         """Get the hierarchical coordinate corresponding to a linear index.
 
         This method maps from a linear index back to the logical coordinate
@@ -913,15 +1345,21 @@ class _Layout(Layout):
 
             layout = make_layout((4, 8), stride=(8, 1))
 
-            # map linear index back to coordinate: 5 -> (1, 1)
-            coord = get_hier_coord(5, layout)
+            # map linear index back to coordinate: 9 -> (1, 1)
+            coord = layout.get_hier_coord(9)
         """
         idx_val = Int32(idx).ir_value(loc=loc, ip=ip)
         crd = _cute_ir.get_hier_coord(idx_val, self, loc=loc, ip=ip)
         return _unpack_x_tuple(crd, loc=loc, ip=ip)
 
     @dsl_user_op
-    def get_flat_coord(self, idx, *, loc=None, ip=None) -> Coord:
+    def get_flat_coord(
+        self,
+        idx: Int,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Coord:
         idx_val = Int32(idx).ir_value(loc=loc, ip=ip)
         res = _cute_ir.get_flat_coord(idx_val, self, loc=loc, ip=ip)
         return _unpack_x_tuple(res, loc=loc, ip=ip)
@@ -937,7 +1375,7 @@ class _ComposedLayout(ComposedLayout):
     to coordinate as inner layout.
     """
 
-    def __init__(self, value) -> None:
+    def __init__(self, value: ir.Value) -> None:
         """Initialize a ComposedLayout object.
 
         :param value: The operation result value to wrap.
@@ -957,24 +1395,53 @@ class _ComposedLayout(ComposedLayout):
 
     @property
     @dsl_user_op
-    def inner(self, *, loc=None, ip=None) -> Union[Swizzle, Layout]:
+    def inner(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Union[Swizzle, Layout]:
         return _cute_ir.composed_get_inner(self.value, loc=loc, ip=ip)
 
     @property
     @dsl_user_op
-    def offset(self, *, loc=None, ip=None) -> IntTuple:
+    def offset(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> IntTuple:
         return _unpack_x_tuple(
             _cute_ir.composed_get_offset(self.value, loc=loc, ip=ip), loc=loc, ip=ip
         )
 
     @property
     @dsl_user_op
-    def outer(self, *, loc=None, ip=None) -> Layout:
+    def outer(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Layout:
         return _cute_ir.composed_get_outer(self.value, loc=loc, ip=ip)
 
     @property
     @dsl_user_op
-    def shape(self, *, loc=None, ip=None) -> Shape:
+    def shape(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Shape:
+        return self.shape_method(loc=loc, ip=ip)
+
+    @dsl_user_op
+    def shape_method(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Shape:
         return _unpack_x_tuple(
             _cute_ir.get_shape(self.value, loc=loc, ip=ip), loc=loc, ip=ip
         )
@@ -983,7 +1450,7 @@ class _ComposedLayout(ComposedLayout):
     def max_alignment(self) -> int:
         return self.type.max_alignment
 
-    def __eq__(self, other) -> Union[bool, Boolean]:
+    def __eq__(self, other: object) -> Union[bool, Boolean]:  # type: ignore[override]
         if isinstance(other, _ComposedLayout):
             if is_static(self.type) and is_static(other.type):
                 return self.type == other.type
@@ -994,41 +1461,52 @@ class _ComposedLayout(ComposedLayout):
         else:
             return False
 
-    def __req__(self, other) -> Union[bool, Boolean]:
+    def __req__(self, other: object) -> Union[bool, Boolean]:
         if isinstance(other, _ComposedLayout):
             return Boolean(other.__eq__(self))
         return False
 
-    def __ne__(self, other) -> Union[bool, Boolean]:
+    def __ne__(self, other: object) -> Union[bool, Boolean]:  # type: ignore[override]
         return not self.__eq__(other)
 
-    def __rne__(self, other) -> Union[bool, Boolean]:
+    def __rne__(self, other: object) -> Union[bool, Boolean]:
         if isinstance(other, _ComposedLayout):
             return other.__ne__(self)
         return True
 
     @dsl_user_op
-    def __getitem__(self, idx: int, *, loc=None, ip=None) -> "_ComposedLayout":
+    def __getitem__(
+        self,
+        idx: int,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> "_ComposedLayout":
         """
         Top-level `get` to provide a syntax similar to `tuple`.
         """
-        return get(self, mode=[idx], loc=loc, ip=ip)
+        return get(self, mode=[idx], loc=loc, ip=ip)  # type: ignore[return-value]
 
     @dsl_user_op
-    def __call__(self, coord: Coord, loc=None, ip=None) -> IntTuple:
+    def __call__(
+        self,
+        coord: Coord,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> IntTuple:
         return crd2idx(coord, self, loc=loc, ip=ip)
 
-    def __extract_mlir_values__(self):
+    def __extract_mlir_values__(self) -> List[ir.Value]:
         return [self.value]
 
-    def __new_from_mlir_values__(self, values):
+    def __new_from_mlir_values__(self, values: List[ir.Value]) -> "_ComposedLayout":
         # Only expecting single value of _ComposedLayout or ir.Value
         # In this context, a _ComposedLayout instance is an encapsulated ir.Value which is automatically created
         # by value caster for ComposedLayout typed values
         assert len(values) == 1, f"Expected 1 value, but got {len(values)}"
-        assert isinstance(
-            values[0], (_ComposedLayout, ir.Value)
-        ), f"Expected _ComposedLayout or ir.Value, but got {type(values[0])}"
+        assert isinstance(values[0], (_ComposedLayout, ir.Value)), (
+            f"Expected _ComposedLayout or ir.Value, but got {type(values[0])}"
+        )
         return _ComposedLayout(
             values[0] if isinstance(values[0], ir.Value) else values[0].value,
         )
@@ -1058,39 +1536,46 @@ class _Pointer(Pointer):
            T(c) = (E ∘ L)(c) = *(E + L(c))
     """
 
-    def __init__(self, value) -> None:
-        assert isinstance(value, ir.Value)
-        self.value = ir.Value(value)
+    def __init__(self, value: ir.Value, dtype: Optional[Type[Numeric]] = None) -> None:
+        assert isinstance(value, ir.Value), f"Expected ir.Value, but got {type(value)}"
+        self.value = value
+
+        if isinstance(
+            value.type.value_type,
+            (_cute_ir.SparseElemType, _cute_nvgpu_ir.TmaDescriptorTiledType),
+        ):
+            dtype = value.type.value_type
+        self._dtype = dtype or Numeric.from_mlir_type(value.type.value_type)
 
     def __str__(self) -> str:
         # Cut off the MLIR type's string for making pretty_str more concise
         return self.type.__str__()[6:]
 
-    def __get_mlir_types__(self):
+    def __get_mlir_types__(self) -> List[ir.Type]:
         return [self.value.type]
 
-    def __extract_mlir_values__(self):
+    def __extract_mlir_values__(self) -> List[ir.Value]:
         return [self.value]
 
-    def __new_from_mlir_values__(self, values):
+    def __new_from_mlir_values__(self, values: List[ir.Value]) -> "_Pointer":
         # Only expecting single value of _Pointer instance or ir.Value
         # In this context, a _Pointer instance is an encapsulated ir.Value which is automatically created
         # by value caster for cute.ptr typed values
         assert len(values) == 1, f"Expected 1 value, but got {len(values)}"
-        assert isinstance(
-            values[0], (_Pointer, ir.Value)
-        ), f"Expected _Pointer or ir.Value, but got {type(values[0])}"
+        assert isinstance(values[0], (_Pointer, ir.Value)), (
+            f"Expected _Pointer or ir.Value, but got {type(values[0])}"
+        )
         return _Pointer(
             values[0] if isinstance(values[0], ir.Value) else values[0].value
         )
 
     @property
-    @lru_cache_ir()
-    def dtype(self) -> Union[Type[Numeric], _cute_ir.SparseElemType]:
-        if isinstance(self.value.type.value_type, _cute_ir.SparseElemType):
-            return self.value.type.value_type
-        else:
-            return Numeric.from_mlir_type(self.value.type.value_type)
+    def dtype(
+        self,
+    ) -> Union[
+        Type[Numeric],
+    ]:
+        return self._dtype
 
     @property
     def alignment(self) -> int:
@@ -1111,24 +1596,177 @@ class _Pointer(Pointer):
     def type(self) -> ir.Type:
         return self.value.type
 
+    @dsl_user_op
+    def load(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Numeric:
+        # LLVM doesn't support load/store narrow precision per element
+        tmp_ty = self.dtype.mlir_type
+        element_precision_width = _element_precision_width(self.dtype)
+        if self.dtype is Boolean or element_precision_width == 8:
+            tmp_ty = T.i8()
+        elif element_precision_width < 8:
+            raise ValueError(
+                f"Loading narrow precision type {self.dtype} is not supported"
+            )
+
+        llvm_ptr = self.to_llvm_ptr(loc=loc, ip=ip)
+        tmp_val = llvm.load(tmp_ty, llvm_ptr, loc=loc, ip=ip)
+        if element_precision_width == 8:
+            tmp_val = arith.bitcast(self.dtype.mlir_type, tmp_val, loc=loc, ip=ip)
+
+        return self.dtype(tmp_val, loc=loc, ip=ip)
+
+    @dsl_user_op
+    def store(
+        self,
+        value: Union[Numeric, cutlass_arith.ArithValue, int, float, bool],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> None:
+        if isinstance(value, (int, float, bool, cutlass_arith.ArithValue)):
+            value = self.dtype(value, loc=loc, ip=ip)
+        elif isinstance(value, Numeric):
+            if value.dtype is not self.dtype:
+                value = value.to(self.dtype, loc=loc, ip=ip)
+        else:
+            raise ValueError(f"Unsupported value type: {type(value)}")
+        # LLVM doesn't support load/store narrow precision per element
+        tmp_val = value.ir_value(loc=loc, ip=ip)
+        element_precision_width = _element_precision_width(self.dtype)
+        if element_precision_width == 8:
+            tmp_val = arith.bitcast(T.i8(), tmp_val, loc=loc, ip=ip)
+        elif self.dtype is not Boolean and element_precision_width < 8:
+            raise ValueError(
+                f"Storing narrow precision type {self.dtype} is not supported"
+            )
+
+        llvm_ptr = self.to_llvm_ptr(loc=loc, ip=ip)
+        return llvm.store(tmp_val, llvm_ptr, loc=loc, ip=ip)
+
+    @dsl_user_op
+    def __getitem__(
+        self,
+        idx: Int,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Pointer:
+        return (self + idx).load()
+
+    @dsl_user_op
+    def __setitem__(
+        self,
+        idx: Int,
+        value: Numeric,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Pointer:
+        (self + idx).store(value, loc=loc, ip=ip)
+        return value  # type: ignore[return-value]
+
     # Only use if you absolutely need to get the LLVM pointer Value
     @property
     @dsl_user_op
     @lru_cache_ir()
-    def llvm_ptr(self, *, loc=None, ip=None) -> ir.Value:
+    def llvm_ptr(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> ir.Value:
         """
         Get the LLVM pointer representation of this pointer.
 
+        :param loc: Source location for MLIR, defaults to None
+        :type loc: Optional[Location]
+        :param ip: Insertion point for MLIR, defaults to None
+        :type ip: Optional[InsertionPoint]
         :return: The LLVM pointer representation
         :rtype: ir.Value
         """
-        llvm_ptr_ty = llvm.PointerType.get(self.memspace.value)
+        return self.to_llvm_ptr(loc=loc, ip=ip)
+
+    @dsl_user_op
+    @lru_cache_ir()
+    def to_llvm_ptr(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> ir.Value:
+        """
+        Get the LLVM pointer representation of this pointer. (Used by internal API to propagate loc and ip)
+
+        :param loc: Source location for MLIR, defaults to None
+        :type loc: Optional[Location]
+        :param ip: Insertion point for MLIR, defaults to None
+        :type ip: Optional[InsertionPoint]
+        :return: The LLVM pointer representation
+        :rtype: ir.Value
+        """
+        llvm_ptr_ty = llvm.PointerType.get(
+            self.memspace.value if self.memspace != AddressSpace.rmem else 0
+        )
         return builtin.unrealized_conversion_cast(
             [llvm_ptr_ty], [self.value], loc=loc, ip=ip
         )
 
     @dsl_user_op
-    def __add__(self, offset: Int, *, loc=None, ip=None) -> Pointer:
+    @lru_cache_ir()
+    def _to_builtin_memref(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> ir.Value:
+        """
+        Convert this pointer to a builtin memref (without any layout information).
+
+        :param loc: Source location for MLIR, defaults to None
+        :type loc: Optional[Location]
+        :param ip: Insertion point for MLIR, defaults to None
+        :type ip: Optional[InsertionPoint]
+        :return: The builtin memref representation
+        :rtype: ir.Value
+        """
+
+        memref_ty = BuiltinMemRefType.get(
+            shape=[],
+            element_type=self.type.value_type,
+            layout=None,
+            memory_space=ir.Attribute.parse(
+                str(self.memspace.value if self.memspace != AddressSpace.rmem else 0)
+            ),
+            loc=loc,
+        )
+        idx_ty = Int64.mlir_type
+        offset = Int64(0).ir_value(loc=loc, ip=ip)
+
+        memref_desc_ty = llvm.StructType.get_literal(
+            [self.llvm_ptr.type, self.llvm_ptr.type, idx_ty]
+        )
+        memref_desc = llvm.mlir_undef(memref_desc_ty, loc=loc, ip=ip)
+        memref_desc = llvm.insertvalue(memref_desc, self.llvm_ptr, [0], loc=loc, ip=ip)
+        memref_desc = llvm.insertvalue(memref_desc, self.llvm_ptr, [1], loc=loc, ip=ip)
+        memref_desc = llvm.insertvalue(memref_desc, offset, [2], loc=loc, ip=ip)
+        return builtin.unrealized_conversion_cast(
+            [memref_ty], [memref_desc], loc=loc, ip=ip
+        )
+
+    @dsl_user_op
+    def __add__(  # type: ignore[override]
+        self,
+        offset: Int,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Pointer:
         """
         Offset the pointer by elements of a layout's codomain.
 
@@ -1137,20 +1775,38 @@ class _Pointer(Pointer):
         :return: A new pointer offset by the specified amount
         :rtype: ir.Value
         """
-        offset = _pack_int_tuple(offset, loc=loc, ip=ip)  # type: ignore
+        offset = _pack_int_tuple(offset, loc=loc, ip=ip)
         return _cute_ir.add_offset(self.value, offset=offset, loc=loc, ip=ip)
 
     @dsl_user_op
-    def __radd__(self, offset: Int, *, loc=None, ip=None) -> Pointer:
+    def __radd__(
+        self,
+        offset: Int,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Pointer:
         return self.__add__(offset, loc=loc, ip=ip)
 
     @dsl_user_op
-    def __sub__(self, offset: Int, *, loc=None, ip=None) -> Pointer:
-        return self.__add__(-offset, loc=loc, ip=ip)  # type: ignore
+    def __sub__(
+        self,
+        offset: Int,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Pointer:
+        return self.__add__(-offset, loc=loc, ip=ip)
 
     @dsl_user_op
     @lru_cache_ir()
-    def toint(self, *, loc=None, ip=None):
+    def toint(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Numeric:
+        res_type: Type[Integer]
         if self.memspace in (AddressSpace.gmem, AddressSpace.generic):
             res_type = Int64
         else:
@@ -1161,7 +1817,13 @@ class _Pointer(Pointer):
         )
 
     @dsl_user_op
-    def align(self, min_align: int, *, loc=None, ip=None) -> Pointer:
+    def align(
+        self,
+        min_align: int,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Pointer:
         """
         Align a pointer to a specified byte alignment.
 
@@ -1210,16 +1872,84 @@ class _Pointer(Pointer):
 ####################################################################################################
 
 
-def _op_wrapper(op_fn, input):
+def _op_wrapper(
+    op_fn: Any,
+    input: Any,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Any:
     from .tensor import _Tensor
 
     if isinstance(input, Tensor):
-        res = op_fn(input.value)
-        return _Tensor(res, dtype=input.element_type)
+        res = op_fn(input.value, loc=loc, ip=ip)
+        return _Tensor(res, dtype=input.element_type, loc=loc, ip=ip)
     elif isinstance(input, _ComposedLayout):
-        return op_fn(input.value)
+        return op_fn(input.value, loc=loc, ip=ip)
+    elif (
+        not isinstance(input, ir.Value)
+        and hasattr(input, "value")
+        and isinstance(input.value, ir.Value)
+    ):
+        # support types with ViewTypeInterface defined outside of cute_ir
+        res = op_fn(input.value, loc=loc, ip=ip)
+        return type(input)(res)
     else:
-        return op_fn(input)
+        return op_fn(input, loc=loc, ip=ip)
+
+
+def ModeOpDecorator(func: Any) -> Any:
+    class ModeOp:
+        """
+        A generic class for operations that support mode indexing.
+
+        This enables syntax like:
+        op(obj)       <==>  op(obj, mode=[])    # Apply op to obj with no mode filtering
+        op[0](obj)    <==>  op(obj, mode=[0])   # Apply op to obj after getting mode 0
+        op[0,1](obj)  <==>  op(obj, mode=[0,1]) # Apply op to obj after getting modes (0,1)
+        """
+
+        def __init__(self, func: Any, mode: Union[Tuple[int, ...], int] = ()) -> None:
+            """
+            Initialize ModeOp.
+            """
+            self.func = func
+            self.mode = (
+                tuple(mode)
+                if isinstance(mode, list)
+                else wrap(mode)
+                if mode is not None
+                else ()
+            )
+
+        def __call__(
+            self,
+            obj: Any,
+            mode: Union[Tuple[int, ...], List[int], int, None] = (),
+            **kwargs: Any,
+        ) -> Any:
+            """Apply the function with optional mode specification."""
+            mode = (
+                tuple(mode)
+                if isinstance(mode, list)
+                else wrap(mode)
+                if mode is not None
+                else ()
+            )
+            return self.func(obj, mode=list(self.mode + mode), **kwargs)
+
+        def __getitem__(self, mode: Union[Tuple[int, ...], int]) -> "ModeOp":
+            """Return a new instance with new modes appended to existing modes."""
+            mode = (
+                tuple(mode)
+                if isinstance(mode, list)
+                else wrap(mode)
+                if mode is not None
+                else ()
+            )
+            return ModeOp(self.func, self.mode + mode)
+
+    return ModeOp(func)
 
 
 #
@@ -1227,7 +1957,7 @@ def _op_wrapper(op_fn, input):
 #
 
 
-def is_valid_leaf(a) -> bool:
+def is_valid_leaf(a: object) -> bool:
     """
     Returns whether `a` has a type that is valid for a CuTe tuple's leaf.
     """
@@ -1238,7 +1968,7 @@ def is_valid_leaf(a) -> bool:
     )
 
 
-def is_static(x: Any) -> bool:
+def is_static(x: object) -> bool:
     """Check if a value is statically known at compile time.
 
     In CuTe, static values are those whose values are known at compile time,
@@ -1277,7 +2007,7 @@ def is_static(x: Any) -> bool:
     elif isinstance(x, _ComposedLayout):
         return _cute_ir.is_static(x.type)
     elif is_dynamic_expression(x):
-        return _cute_ir.is_static(x.type)
+        return _cute_ir.is_static(x.type)  # type: ignore[attr-defined]
     elif isinstance(x, (bool, int, float)) or x is None:
         return True
     else:
@@ -1313,7 +2043,7 @@ def _tuple_str(t: Tuple[Any, ...]) -> str:
     Constructs a string representation of a python tuple without calling __repr__ on its elements.
     """
 
-    def construct_inner_str(t) -> str:
+    def construct_inner_str(t: Any) -> str:
         if not isinstance(t, tuple):
             return pretty_str(t)
         res = ""
@@ -1328,7 +2058,7 @@ def _tuple_str(t: Tuple[Any, ...]) -> str:
     return res
 
 
-def pretty_str(arg) -> str:
+def pretty_str(arg: object) -> str:
     """
     Constructs a concise readable pretty string.
     """
@@ -1344,13 +2074,18 @@ def pretty_str(arg) -> str:
 
 
 @dsl_user_op
-def printf(*args, loc=None, ip=None) -> None:
+def printf(
+    *args: Any,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+    end: str = "\n",
+) -> None:
     """
     Print one or more values with optional formatting.
 
     This function provides printf-style formatted printing capabilities. It can print values directly
     or format them using C-style format strings. The function supports printing various types including
-    layouts, numeric values, tensors, and other CuTe objects.
+    layouts, numeric values, tensors, pointers, and other CuTe objects.
 
     The function accepts either:
     1. A list of values to print directly
@@ -1364,6 +2099,8 @@ def printf(*args, loc=None, ip=None) -> None:
     :type loc: Optional[Location]
     :param ip: Insertion point for code generation, defaults to None
     :type ip: Optional[InsertionPoint]
+    :param end: Suffix for the printed value, defaults to newline
+    :type end: Optional[str]
     :raises ValueError: If no arguments are provided
     :raises TypeError: If an unsupported argument type is passed
 
@@ -1393,44 +2130,77 @@ def printf(*args, loc=None, ip=None) -> None:
         raise ValueError("expects at least one argument to print")
 
     if isinstance(args[0], str):
-        fmt = args[0] + "\n"
+        fmt = args[0] + end
         args = args[1:]
     else:
-        fmt = "{}" + ", {}" * (len(args) - 1) + "\n"
+        fmt = "{}" + ", {}" * (len(args) - 1) + end
 
-    def process_arg(arg):
-        arg0 = arg.value if isinstance(arg, Numeric) else arg
+    def process_arg(arg: Any) -> Any:
+        if isinstance(arg, Numeric):
+            return arg.ir_value(loc=loc, ip=ip)
 
-        if isinstance(arg0, ir.Value):
-            return arg0
-        elif isinstance(arg0, bool):
-            return const(arg0, Boolean)
-        elif isinstance(arg0, int):
-            return const(arg0, Int32)
-        elif isinstance(arg0, float):
-            return const(arg0, Float32)
-        elif has_underscore(arg0):
+        if isinstance(arg, _BasePointer):
+            ptr = make_ptr(
+                arg.dtype,
+                arg.to_llvm_ptr(loc=loc, ip=ip),
+                loc=loc,
+                ip=ip,
+            )
+            return ptr.value
+        elif isinstance(arg, ir.Value):
+            return arg
+        elif isinstance(arg, bool):
+            return const(arg, Boolean)
+        elif isinstance(arg, int):
+            return const(arg, Int32)
+        elif isinstance(arg, float):
+            return const(arg, Float32)
+        elif has_underscore(arg):
             # Assume it's a coordinate
-            return _pack_coord(arg0)
-        elif has_scaled_basis(arg0):
+            return _pack_coord(arg)  # type: ignore[arg-type]
+        elif has_scaled_basis(arg):
             # Assume it's a stride
-            return _pack_stride(arg0)
-        elif is_int_tuple(arg0):
-            return _pack_int_tuple(arg0)
-        elif isinstance(arg0, tuple):
+            return _pack_stride(arg)  # type: ignore[arg-type]
+        elif is_int_tuple(arg):
+            return _pack_int_tuple(arg)  # type: ignore[arg-type]
+        elif isinstance(arg, tuple):
             # Assume it's a tile
-            return _pack_tile(arg0)
-        elif isinstance(arg0, (_Tensor, _Pointer, _ComposedLayout)):
-            return arg0.value
+            return _pack_tile(arg)
+        elif isinstance(arg, _Tensor):
+            arg._check_can_load_store()
+            if isinstance(arg.layout, ComposedLayout) and isinstance(
+                arg.layout.inner, Swizzle
+            ):
+                raise NotImplementedError(
+                    "tensor with swizzled layout (PISL) is not supported in printf, please use swizzled pointer (PDSL) instead"
+                )
+            return arg.value
+        elif isinstance(arg, (_Pointer, _ComposedLayout)):
+            return arg.value
         else:
             raise TypeError(f"unsupported argument type in printf, got {type(arg)}")
 
-    args = [process_arg(a) for a in args]
-    _cute_ir.print_(args, fmt=fmt, loc=loc, ip=ip)
+    processed_args = [process_arg(a) for a in args]
+    operand_signed = [bool(getattr(type(a), "signed", True)) for a in args]
+    if all(operand_signed):
+        _cute_ir.print_(processed_args, fmt=fmt, loc=loc, ip=ip)
+    else:
+        _cute_ir.print_(
+            processed_args,
+            fmt=fmt,
+            operand_signed=ir.DenseBoolArrayAttr.get(operand_signed),
+            loc=loc,
+            ip=ip,
+        )
 
 
 @dsl_user_op
-def front(input, *, loc=None, ip=None):
+def front(
+    input: Any,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Any:
     """Recursively get the first element of input.
 
     This function traverses a hierarchical structure (like a layout or tensor)
@@ -1454,7 +2224,13 @@ def front(input, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def is_major(mode, stride: Stride, *, loc=None, ip=None) -> bool:
+def is_major(
+    mode: Union[int, List[int]],
+    stride: Stride,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> bool:
     """
     Check whether a mode in stride is the major mode.
     """
@@ -1465,8 +2241,24 @@ def is_major(mode, stride: Stride, *, loc=None, ip=None) -> bool:
 
 
 @dsl_user_op
-def assume(src, divby=None, *, loc=None, ip=None):
+def assume(
+    src: Any,
+    divby: Optional[int] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Any:
     if divby is None:
+        return src
+
+    if not isinstance(divby, int) or divby <= 0:
+        raise ValueError(f"Expected `divby` to be a positive integer, got {divby}")
+
+    if isinstance(src, int):
+        if src % divby != 0:
+            raise ValueError(
+                f"Expected {src} to be divisible by {divby}, got {src % divby}"
+            )
         return src
 
     if isinstance(src, Integer):
@@ -1482,26 +2274,41 @@ def assume(src, divby=None, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def make_swizzle(b, m, s, *, loc=None, ip=None):
+def make_swizzle(
+    b: int,
+    m: int,
+    s: int,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Swizzle:
     # canonicalize to <0, 4, 3> for identity swizzle (as compiler assumes <0, 4, 3>)
+    if not isinstance(b, int) or not isinstance(m, int) or not isinstance(s, int):
+        raise ValueError("b, m, and s must be int")
     if b == 0:
         m, s = 4, 3
     ty = ir.Type.parse(f'!cute.swizzle<"S<{b},{m},{s}>">')
     return Swizzle(static(ty, loc=loc, ip=ip))
 
 
-@dsl_user_op
-def make_sparse_elem(num_logical, num_phys, elem_type, *, loc=None, ip=None):
-    return _cute_ir.SparseElemType.get(num_logical, num_phys, elem_type.mlir_type)
-
 
 @dsl_user_op
-def static(value, *, loc=None, ip=None):
+def static(
+    value: Any,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Any:
     return _cute_ir.static(value, loc=loc, ip=ip)
 
 
 @dsl_user_op
-def get_leaves(value, *, loc=None, ip=None):
+def get_leaves(
+    value: Any,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Any:
     return _cute_ir.get_leaves(value, loc=loc, ip=ip)
 
 
@@ -1527,12 +2334,9 @@ def depth(a: Union[XTuple, Layout, "ComposedLayout"]) -> int:
 
     .. code-block:: python
 
-        >>> depth(1)
-        0
-        >>> depth((1, 2))
-        1
-        >>> depth(((1, 2), (3, 4)))
-        2
+        depth(1)                # 0
+        depth((1, 2))           # 1
+        depth(((1, 2), (3, 4))) # 2
     """
     if type(a) is tuple:
         if not a:
@@ -1544,8 +2348,9 @@ def depth(a: Union[XTuple, Layout, "ComposedLayout"]) -> int:
         return 0
 
 
+@ModeOpDecorator
 @lru_cache_ir()
-def rank(a: Union[XTuple, Layout, "ComposedLayout"], mode: List[int] = []) -> int:  # type: ignore
+def rank(a: Union[XTuple, Layout, "ComposedLayout"], mode: List[int] = []) -> int:
     """Returns the rank (dimensionality) of a tuple, layout, or tensor.
 
     The rank of a tuple is its length. For layouts and tensors, the rank is
@@ -1560,10 +2365,13 @@ def rank(a: Union[XTuple, Layout, "ComposedLayout"], mode: List[int] = []) -> in
     This function is used in layout algebra to determine the dimensionality
     of tensors and layouts for operations like slicing and evaluation.
     """
-    if isinstance(a, (Layout, ComposedLayout, Tensor)):
+    # support types with ViewTypeInterface defined outside of cute_ir
+    if isinstance(a, (Layout, ComposedLayout, Tensor)) or hasattr(a, "shape"):
         return rank(a.shape, mode)
 
-    if (not isinstance(mode, list)) or any(not isinstance(m, int) for m in mode):
+    # Guaranteed by ModeOpDecorator
+    assert isinstance(mode, list)
+    if any(not isinstance(m, int) for m in mode):
         raise ValueError(f"Expected 'mode' to be a list of int, but got {mode}")
 
     if mode:
@@ -1651,14 +2459,39 @@ def is_weakly_congruent(
 
 
 @overload
-def get(input: Layout, mode, *, loc=None, ip=None) -> Layout: ...
+def get(
+    input: Layout,
+    mode: Any = ...,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
 @overload
-def get(input: ComposedLayout, mode, *, loc=None, ip=None) -> ComposedLayout: ...
+def get(
+    input: ComposedLayout,
+    mode: Any = ...,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> ComposedLayout: ...
 @overload
-def get(input: XTuple, mode, *, loc=None, ip=None) -> XTuple: ...
+def get(
+    input: XTuple,
+    mode: Any = ...,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> XTuple: ...
 
 
-def get(input, mode: List[int], *, loc=None, ip=None):
+@ModeOpDecorator
+def get(
+    input: Any,
+    mode: List[int] = [],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Any:
     """Extract a specific element or sub-layout from a layout or tuple.
 
     This function recursively traverses the input according to the mode indices,
@@ -1668,7 +2501,7 @@ def get(input, mode: List[int], *, loc=None, ip=None):
     :param input: The input layout or tuple to extract from
     :type input: Layout, ComposedLayout, tuple
     :param mode: Indices specifying the path to traverse for extraction
-    :type mode: List[int]
+    :type mode: int or list of ints
     :param loc: Source location for MLIR, defaults to None
     :type loc: optional
     :param ip: Insertion point, defaults to None
@@ -1711,26 +2544,51 @@ def get(input, mode: List[int], *, loc=None, ip=None):
 
         if isinstance(input, _ComposedLayout):
             input = input.value
-        res_ty = input.type.get_op_res_type(mode=mode)  # type: ignore
+        res_ty = input.type.get_op_res_type(mode=mode)
         return _cute_ir.get(res_ty, input, mode=mode, loc=loc, ip=ip)
 
 
 @overload
-def select(input: Layout, mode, *, loc=None, ip=None) -> Layout: ...
+def select(
+    input: Layout,
+    mode: Any = ...,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
 @overload
-def select(input: ComposedLayout, mode, *, loc=None, ip=None) -> ComposedLayout: ...
+def select(
+    input: ComposedLayout,
+    mode: Any = ...,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> ComposedLayout: ...
 @overload
-def select(input: XTuple, mode, *, loc=None, ip=None) -> XTuple: ...
+def select(
+    input: XTuple,
+    mode: Any = ...,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> XTuple: ...
 
 
+@ModeOpDecorator
 @dsl_user_op
-def select(input, mode: List[int], *, loc=None, ip=None):
+def select(
+    input: Any,
+    mode: List[int] = [],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Any:
     """Select modes from input.
 
     :param input: Input to select from
     :type input: Layout, ComposedLayout, tuple
     :param mode: Indices specifying which dimensions or elements to select
-    :type mode: List[int]
+    :type mode: int or list of ints
     :param loc: Source location for MLIR, defaults to None
     :type loc: optional
     :param ip: Insertion point, defaults to None
@@ -1773,24 +2631,51 @@ def select(input, mode: List[int], *, loc=None, ip=None):
 
 @overload
 def group_modes(
-    input: Layout, begin: int, end: int, *, loc=None, ip=None
+    input: Layout,
+    begin: int,
+    end: int,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Layout: ...
 @overload
 def group_modes(
-    input: ComposedLayout, begin: int, end: int, *, loc=None, ip=None
+    input: ComposedLayout,
+    begin: int,
+    end: int,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> ComposedLayout: ...
 @overload
 def group_modes(
-    input: Tensor, begin: int, end: int, *, loc=None, ip=None
+    input: Tensor,
+    begin: int,
+    end: int,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Tensor: ...
 @overload
 def group_modes(
-    input: XTuple, begin: int, end: int, *, loc=None, ip=None
+    input: XTuple,
+    begin: int,
+    end: int,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> XTuple: ...
 
 
 @dsl_user_op
-def group_modes(input, begin: int, end: Optional[int] = None, *, loc=None, ip=None):
+def group_modes(
+    input: Union[Layout, ComposedLayout, Tensor, XTuple],
+    begin: int,
+    end: Optional[int] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout, Tensor, XTuple]:
     """Group modes of a hierarchical tuple or layout into a single mode.
 
     This function groups a range of modes from the input object into a single mode,
@@ -1844,24 +2729,52 @@ def group_modes(input, begin: int, end: Optional[int] = None, *, loc=None, ip=No
         return (*input[:begin], (input[begin:end]), *input[end:])
 
     return _op_wrapper(
-        partial(_cute_ir.group_modes, begin=begin, end=end, loc=loc, ip=ip), input
+        partial(_cute_ir.group_modes, begin=begin, end=end), input, loc=loc, ip=ip
     )
 
 
 @overload
-def slice_(src: Layout, coord: Coord, *, loc=None, ip=None) -> Layout: ...
+def slice_(
+    src: Layout,
+    coord: Coord,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
 @overload
 def slice_(
-    src: _ComposedLayout, coord: Coord, *, loc=None, ip=None
+    src: _ComposedLayout,
+    coord: Coord,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> _ComposedLayout: ...
 @overload
-def slice_(src: Tensor, coord: Coord, *, loc=None, ip=None) -> Tensor: ...
+def slice_(
+    src: Tensor,
+    coord: Coord,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Tensor: ...
 @overload
-def slice_(src: XTuple, coord: Coord, *, loc=None, ip=None) -> XTuple: ...
+def slice_(
+    src: XTuple,
+    coord: Coord,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> XTuple: ...
 
 
 @dsl_user_op
-def slice_(src, coord: Coord, *, loc=None, ip=None):
+def slice_(
+    src: Union[Layout, _ComposedLayout, Tensor, XTuple],
+    coord: Coord,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, _ComposedLayout, Tensor, XTuple]:
     """Perform a slice operation on a source object using the given coordinate.
 
     This function implements CuTe's slicing operation which extracts a subset of elements
@@ -1912,7 +2825,7 @@ def slice_(src, coord: Coord, *, loc=None, ip=None):
           * Selecting specific patterns of elements
     """
 
-    def lift_slice(a, b):
+    def lift_slice(a: Any, b: Any) -> tuple:
         if isinstance(a, tuple):
             if (not isinstance(b, tuple)) or (len(a) != len(b)):
                 raise ValueError("coord must be weakly congruent to src in slice_")
@@ -1937,20 +2850,44 @@ def slice_(src, coord: Coord, *, loc=None, ip=None):
             return ()
 
     coord_val = _pack_coord(coord, loc=loc, ip=ip)
-    return _op_wrapper(partial(_cute_ir.slice, coord=coord_val, loc=loc, ip=ip), src)
+    return _op_wrapper(partial(_cute_ir.slice, coord=coord_val), src, loc=loc, ip=ip)
 
 
 @overload
-def dice(src: Layout, dicer: Coord, *, loc=None, ip=None) -> Layout: ...
+def dice(
+    src: Layout,
+    dicer: Coord,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
 @overload
-def dice(src: ComposedLayout, dicer: Coord, *, loc=None, ip=None) -> ComposedLayout: ...
+def dice(
+    src: ComposedLayout,
+    dicer: Coord,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> ComposedLayout: ...
 @overload
-def dice(src: XTuple, dicer: Coord, *, loc=None, ip=None) -> XTuple: ...
+def dice(
+    src: XTuple,
+    dicer: Coord,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> XTuple: ...
 
 
 @dsl_user_op
 @lru_cache_ir()
-def dice(src, dicer, *, loc=None, ip=None):
+def dice(
+    src: Union[Layout, ComposedLayout, XTuple],
+    dicer: Coord,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout, XTuple]:
     """Keep modes in input when it is paired with an integer in dicer.
 
     This function performs dicing operation on the input based on the dicer coordinate.
@@ -1987,7 +2924,7 @@ def dice(src, dicer, *, loc=None, ip=None):
     if not is_static(dicer):
         raise ValueError(f"expects dicer to be static, but got {dicer}")
 
-    def lift_dice(a, b):
+    def lift_dice(a: Any, b: Any) -> tuple:
         if isinstance(a, tuple):
             if (not isinstance(b, tuple)) or (len(a) != len(b)):
                 raise ValueError("dicer must be weakly congruent to input in dice")
@@ -2013,11 +2950,18 @@ def dice(src, dicer, *, loc=None, ip=None):
 
     dicer_val = _pack_coord(dicer, loc=loc, ip=ip)
     return _op_wrapper(
-        partial(_cute_ir.dice, coord=dicer_val.type.attribute, loc=loc, ip=ip), src
+        partial(_cute_ir.dice, coord=dicer_val.type.attribute), src, loc=loc, ip=ip
     )
 
 
-def _extend(func, input, elem, up_to_rank, loc, ip):
+def _extend(
+    func: Any,
+    input: Any,
+    elem: Any,
+    up_to_rank: Optional[int],
+    loc: Optional[ir.Location],
+    ip: Optional[ir.InsertionPoint],
+) -> Any:
     if input is None:
         raise ValueError("No input provided for input")
 
@@ -2028,7 +2972,7 @@ def _extend(func, input, elem, up_to_rank, loc, ip):
             raise TypeError(f"Input type of elem ({type(elem)}) is not accepted!")
         N = rank(input) + 1 if up_to_rank is None else up_to_rank
 
-        return _op_wrapper(partial(func, N, element=elem, loc=loc, ip=ip), input)
+        return _op_wrapper(partial(func, N, element=elem), input, loc=loc, ip=ip)
 
     if is_valid_leaf(input) or isinstance(input, tuple):
         if elem is None:
@@ -2053,20 +2997,42 @@ def _extend(func, input, elem, up_to_rank, loc, ip):
 
 @overload
 def prepend(
-    input: Layout, elem: Layout, up_to_rank=None, *, loc=None, ip=None
+    input: Layout,
+    elem: Layout,
+    up_to_rank: Optional[int] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Layout: ...
 @overload
 def prepend(
-    input: ComposedLayout, elem: Layout, up_to_rank=None, *, loc=None, ip=None
+    input: ComposedLayout,
+    elem: Layout,
+    up_to_rank: Optional[int] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> ComposedLayout: ...
 @overload
 def prepend(
-    input: XTuple, elem: XTuple, up_to_rank=None, *, loc=None, ip=None
+    input: XTuple,
+    elem: XTuple,
+    up_to_rank: Optional[int] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> XTuple: ...
 
 
 @dsl_user_op
-def prepend(input, elem, up_to_rank: Union[None, int] = None, *, loc=None, ip=None):
+def prepend(
+    input: Union[Layout, ComposedLayout, XTuple],
+    elem: Any,
+    up_to_rank: Union[None, int] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout, XTuple]:
     """Extend input to rank up_to_rank by prepending elem in front of input.
 
     This function extends the input object by prepending elements to reach a desired rank.
@@ -2108,20 +3074,42 @@ def prepend(input, elem, up_to_rank: Union[None, int] = None, *, loc=None, ip=No
 
 @overload
 def append(
-    input: Layout, elem: Layout, up_to_rank=None, *, loc=None, ip=None
+    input: Layout,
+    elem: Layout,
+    up_to_rank: Optional[int] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Layout: ...
 @overload
 def append(
-    input: ComposedLayout, elem: Layout, up_to_rank=None, *, loc=None, ip=None
+    input: ComposedLayout,
+    elem: Layout,
+    up_to_rank: Optional[int] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> ComposedLayout: ...
 @overload
 def append(
-    input: XTuple, elem: XTuple, up_to_rank=None, *, loc=None, ip=None
+    input: XTuple,
+    elem: XTuple,
+    up_to_rank: Optional[int] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> XTuple: ...
 
 
 @dsl_user_op
-def append(input, elem, up_to_rank: Union[None, int] = None, *, loc=None, ip=None):
+def append(
+    input: Union[Layout, ComposedLayout, XTuple],
+    elem: Any,
+    up_to_rank: Union[None, int] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout, XTuple]:
     """Extend input to rank up_to_rank by appending elem to the end of input.
 
     This function extends the input object by appending elements to reach a desired rank.
@@ -2169,7 +3157,11 @@ def append(input, elem, up_to_rank: Union[None, int] = None, *, loc=None, ip=Non
 
 @dsl_user_op
 def prepend_ones(
-    t: Tensor, up_to_rank: Union[None, int] = None, *, loc=None, ip=None
+    t: Tensor,
+    up_to_rank: Union[None, int] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Tensor:
     from .tensor import make_tensor
 
@@ -2180,18 +3172,32 @@ def prepend_ones(
 
 @overload
 def append_ones(
-    t: Layout, up_to_rank: Union[None, int] = None, *, loc=None, ip=None
+    t: Layout,
+    up_to_rank: Union[None, int] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Layout: ...
 
 
 @overload
 def append_ones(
-    t: Tensor, up_to_rank: Union[None, int] = None, *, loc=None, ip=None
+    t: Tensor,
+    up_to_rank: Union[None, int] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Tensor: ...
 
 
 @dsl_user_op
-def append_ones(t, up_to_rank: Union[None, int] = None, *, loc=None, ip=None):
+def append_ones(
+    t: Union[Layout, Tensor],
+    up_to_rank: Union[None, int] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, Tensor]:
     from .tensor import make_tensor
 
     if isinstance(t, Tensor):
@@ -2204,7 +3210,7 @@ def append_ones(t, up_to_rank: Union[None, int] = None, *, loc=None, ip=None):
         raise TypeError(f"expects Tensor or Layout, but got {type(t)}")
 
 
-def repeat_as_tuple(x, n) -> tuple:
+def repeat_as_tuple(x: Any, n: int) -> tuple:
     """Creates a tuple with x repeated n times.
 
     This function creates a tuple by repeating the input value x n times.
@@ -2230,7 +3236,7 @@ def repeat_as_tuple(x, n) -> tuple:
     return (x,) * n
 
 
-def repeat(x, n):
+def repeat(x: Any, n: int) -> Any:
     """Creates an object by repeating x n times.
 
     This function creates an object by repeating the input value x n times.
@@ -2258,7 +3264,7 @@ def repeat(x, n):
     return x if n == 1 else (x,) * n
 
 
-def repeat_like(x, target):
+def repeat_like(x: Any, target: Any) -> Any:
     """Creates an object congruent to target and filled with x.
 
     This function recursively creates a nested tuple structure that matches the structure
@@ -2298,7 +3304,7 @@ def flatten(a: Tensor) -> Tensor: ...
 def flatten(a: XTuple) -> XTuple: ...
 
 
-def flatten(a):
+def flatten(a: Union[Layout, Tensor, XTuple]) -> Union[Layout, Tensor, XTuple]:
     """Flattens a CuTe data structure into a simpler form.
 
     For tuples, this function flattens the structure into a single-level tuple.
@@ -2336,16 +3342,30 @@ def flatten(a):
 
 @overload
 def filter_zeros(
-    input: Layout, *, target_profile=None, loc=None, ip=None
+    input: Layout,
+    *,
+    target_profile: Optional[Stride] = None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Layout: ...
 @overload
 def filter_zeros(
-    input: Tensor, *, target_profile=None, loc=None, ip=None
+    input: Tensor,
+    *,
+    target_profile: Optional[Stride] = None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Tensor: ...
 
 
 @dsl_user_op
-def filter_zeros(input, *, target_profile=None, loc=None, ip=None):
+def filter_zeros(
+    input: Union[Layout, Tensor],
+    *,
+    target_profile: Optional[Stride] = None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, Tensor]:
     """Filter out zeros from a layout or tensor.
 
     This function removes zero-stride dimensions from a layout or tensor.
@@ -2367,20 +3387,45 @@ def filter_zeros(input, *, target_profile=None, loc=None, ip=None):
     if not isinstance(input, (Layout, Tensor)):
         raise TypeError(f"Expected layout or tensor as input, but got {type(input)=}")
     if isinstance(input, Tensor):
-        input = input.value
+        return _op_wrapper(
+            partial(_cute_ir.filter_zeros, target_profile=target_profile),
+            input,
+            loc=loc,
+            ip=ip,
+        )
     return _cute_ir.filter_zeros(input, target_profile=target_profile, loc=loc, ip=ip)
 
 
 @overload
-def filter(input: Layout, *, loc=None, ip=None) -> Layout: ...
+def filter(
+    input: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
 @overload
-def filter(input: ComposedLayout, *, loc=None, ip=None) -> ComposedLayout: ...
+def filter(
+    input: ComposedLayout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> ComposedLayout: ...
 @overload
-def filter(input: Tensor, *, loc=None, ip=None) -> Tensor: ...
+def filter(
+    input: Tensor,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Tensor: ...
 
 
 @dsl_user_op
-def filter(input, *, loc=None, ip=None):
+def filter(
+    input: Union[Layout, ComposedLayout, Tensor],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout, Tensor]:
     """Filter a layout or tensor.
 
     This function filters a layout or tensor according to CuTe's filtering rules.
@@ -2405,18 +3450,19 @@ def filter(input, *, loc=None, ip=None):
             input.inner, input.offset, filter(input.outer, loc=loc, ip=ip)
         )
     elif isinstance(input, _Tensor):
-        return _cute_ir.filter(input.value, loc=loc, ip=ip)
+        return _op_wrapper(_cute_ir.filter, input, loc=loc, ip=ip)
     else:
         return _cute_ir.filter(input, loc=loc, ip=ip)
 
 
+@ModeOpDecorator
 @dsl_user_op
 def size(
     a: Union[IntTuple, Shape, Layout, ComposedLayout, Tensor],
     mode: List[int] = [],
     *,
-    loc=None,
-    ip=None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Int:
     """Return size of domain of layout or tensor.
 
@@ -2428,7 +3474,7 @@ def size(
     :param a: The input object whose size to compute
     :type a: IntTuple, Shape, Layout, ComposedLayout or Tensor
     :param mode: List of mode(s) for size calculation. If empty, computes total size, defaults to []
-    :type mode: list of int, optional
+    :type mode: int or list of ints, optional
     :param loc: Source location for MLIR, defaults to None
     :type loc: optional
     :param ip: Insertion point, defaults to None
@@ -2448,16 +3494,22 @@ def size(
     if not isinstance(a, (Layout, ComposedLayout, Tensor)):
         a_val = _pack_int_tuple(a, loc=loc, ip=ip)
     elif isinstance(a, (ComposedLayout, Tensor)):
-        a_val = a.value
+        a_val = a.value  # type: ignore[union-attr]
     else:
         a_val = a
 
     res = _cute_ir.size(a_val, mode=mode, loc=loc, ip=ip)
-    return _unpack_x_tuple(res, loc=loc, ip=ip)  # type: ignore
+    return _unpack_x_tuple(res, loc=loc, ip=ip)  # type: ignore[return-value]
 
 
 @dsl_user_op
-def shape_div(lhs: Shape, rhs: Shape, *, loc=None, ip=None) -> Shape:
+def shape_div(
+    lhs: Shape,
+    rhs: Shape,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Shape:
     """Perform element-wise division of shapes.
 
     This function performs element-wise division between two shapes.
@@ -2480,7 +3532,13 @@ def shape_div(lhs: Shape, rhs: Shape, *, loc=None, ip=None) -> Shape:
 
 
 @dsl_user_op
-def ceil_div(input: Shape, tiler: Tiler, *, loc=None, ip=None) -> Shape:
+def ceil_div(
+    input: Shape,
+    tiler: Tiler,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Shape:
     """
     Compute the ceiling division of a target shape by a tiling specification.
 
@@ -2511,6 +3569,8 @@ def ceil_div(input: Shape, tiler: Tiler, *, loc=None, ip=None) -> Shape:
             result = cute.ceil_div(input, tiler)
             print(result)  # Outputs: (4, 2)
     """
+    if isinstance(input, int) and isinstance(tiler, int):
+        return (input + tiler - 1) // tiler
     input_val = _pack_int_tuple(input, loc=loc, ip=ip)
     tiler_val = _pack_tile(tiler, loc=loc, ip=ip)
     res = _cute_ir.ceil_div(input=input_val, tiler=tiler_val, loc=loc, ip=ip)
@@ -2550,16 +3610,25 @@ def round_up(a: IntTuple, b: IntTuple) -> IntTuple:
 
 @dsl_user_op
 def make_layout(
-    shape: Shape, *, stride: Union[Stride, None] = None, loc=None, ip=None
+    shape: Union[Shape, Iterable[Layout]],
+    *,
+    stride: Union[Stride, None] = None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Layout:
     """Create a CuTe Layout object from shape and optional stride information.
 
     A Layout in CuTe represents the mapping between logical and physical coordinates of a tensor.
     This function creates a Layout object that defines how tensor elements are arranged in memory.
 
-    :param shape: Shape of the layout defining the size of each mode
-    :type shape: Shape
-    :param stride: Optional stride values for each mode, defaults to None
+    As an alternative to a shape, an iterable of :class:`Layout` objects may be
+    passed, in which case each layout becomes a separate mode of the result (the
+    ``stride`` argument is ignored). This mirrors CuTe's variadic
+    ``make_layout(layoutA, layoutB, ...)``.
+
+    :param shape: Shape of the layout defining the size of each mode, or an iterable of Layout objects to concatenate (each becomes a mode)
+    :type shape: Union[Shape, Iterable[Layout]]
+    :param stride: Optional stride values for each mode, defaults to None (ignored when shape is an iterable of layouts)
     :type stride: Union[Stride, None]
     :param loc: Source location information, defaults to None
     :type loc: Optional[Location]
@@ -2584,6 +3653,11 @@ def make_layout(
         # Create a layout with custom strides
         layout = make_layout((2,2,2), stride=(4,1,2))   # layout with strides (4,1,2)
 
+        # Concatenate layouts: each becomes a mode of the result
+        mode0 = make_layout(64, stride=1)
+        mode1 = make_layout(128, stride=64)
+        combined = make_layout([mode0, mode1])          # (64,128):(1,64)
+
     Note:
         - If stride is not provided, a default compact left-most stride is computed based on the shape
         - The resulting layout maps logical coordinates to physical memory locations
@@ -2596,17 +3670,37 @@ def make_layout(
         - Stride is keyword only argument to improve readability, e.g.
           * make_layout((3,4), (1,4)) can be confusing with make_layout(((3,4), (1,4)))
           * make_layout((3,4), stride=(1,4)) is more readable
+        - When passing an iterable of layouts, each layout becomes a separate mode
     """
+    # Concatenation form: an iterable of Layouts, each becoming a mode. Strings
+    # and bytes are iterable too, so exclude them; ints are not iterable and so
+    # fall through to the normal shape path unchanged.
+    if isinstance(shape, Iterable) and not isinstance(shape, (str, bytes)):
+        # tuples/lists are reusable; materialize only one-shot iterables (generators).
+        seq = shape if isinstance(shape, (list, tuple)) else list(shape)
+        if seq and all(isinstance(elem, Layout) for elem in seq):
+            # all() above guarantees every element is a Layout; mypy can't infer
+            # that from a runtime predicate, so narrow explicitly.
+            layouts = cast("List[Layout]", seq)
+            return make_layout(
+                tuple(layout.shape for layout in layouts),
+                stride=tuple(layout.stride for layout in layouts),
+                loc=loc,
+                ip=ip,
+            )
+        # Not layouts: keep the materialized form so generators still work below.
+        shape = cast("Shape", seq)
+
     if stride is not None and not is_congruent(shape, stride):
         raise ValueError("shape and stride must be congruent")
 
-    shape_val = _pack_shape(shape, loc=loc, ip=ip)
+    shape_val = _pack_shape(cast("Shape", shape), loc=loc, ip=ip)
     if stride is not None:
         stride_val = _pack_stride(stride, loc=loc, ip=ip)
-        layout_ty = _cute_ir.LayoutType.get(shape_val, stride_val)
+        layout_ty = _cute_ir.LayoutType.get(shape_val.type, stride_val.type)
     else:
         stride_val = None
-        layout_ty = _cute_ir.LayoutType.get(shape_val)
+        layout_ty = _cute_ir.LayoutType.get(shape_val.type)
 
     return _cute_ir.make_layout(
         layout_ty, shape=shape_val, stride=stride_val, loc=loc, ip=ip
@@ -2614,7 +3708,12 @@ def make_layout(
 
 
 @dsl_user_op
-def make_identity_layout(shape: Shape, *, loc=None, ip=None) -> Layout:
+def make_identity_layout(
+    shape: Shape,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout:
     """Create an identity layout with the given shape.
 
     An identity layout maps logical coordinates directly to themselves without any transformation.
@@ -2650,7 +3749,13 @@ def make_identity_layout(shape: Shape, *, loc=None, ip=None) -> Layout:
 
 
 @dsl_user_op
-def make_ordered_layout(shape: Shape, order: Shape, *, loc=None, ip=None) -> Layout:
+def make_ordered_layout(
+    shape: Shape,
+    order: Shape,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout:
     """Create a layout with a specific ordering of dimensions.
 
     This function creates a layout where the dimensions are ordered according to the
@@ -2693,7 +3798,12 @@ def make_ordered_layout(shape: Shape, order: Shape, *, loc=None, ip=None) -> Lay
 
 
 @dsl_user_op
-def make_layout_like(input: Union[Layout, Tensor], *, loc=None, ip=None) -> Layout:
+def make_layout_like(
+    input: Union[Layout, Tensor],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout:
     if isinstance(input, Tensor):
         layout = input.layout
     else:
@@ -2703,7 +3813,15 @@ def make_layout_like(input: Union[Layout, Tensor], *, loc=None, ip=None) -> Layo
 
 class _ComposedLayoutWithInnerFunc(ComposedLayout):
     @dsl_user_op
-    def __init__(self, inner, offset, outer, *, loc=None, ip=None):
+    def __init__(
+        self,
+        inner: Any,
+        offset: IntTuple,
+        outer: Layout,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> None:
         self._inner = inner
         self._offset = offset
         self._outer = outer
@@ -2711,48 +3829,77 @@ class _ComposedLayoutWithInnerFunc(ComposedLayout):
         self._offset_val = _pack_int_tuple(offset, loc=loc, ip=ip)
 
     @dsl_user_op
-    def __call__(self, coord, *, loc=None, ip=None):
+    def __call__(
+        self,
+        coord: Coord,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Any:
         delta = self._outer(coord)
 
         delta_val = _pack_int_tuple(delta, loc=loc, ip=ip)
-        offset_val_new = _cute_ir.add_offset(
-            self._offset_val, delta_val, loc=loc, ip=ip
-        )
+        offset_val_new = _cute_ir.tuple_add(self._offset_val, delta_val, loc=loc, ip=ip)
         offset_new = _unpack_x_tuple(offset_val_new, loc=loc, ip=ip)
 
         return self._inner(offset_new)
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"({self._inner} o {self._offset} o {self._outer})"
 
     @property
-    def type(self):
+    def type(self) -> Any:
         raise ValueError("type is not supported for customized composed layouts")
 
     @property
-    def is_normal(self):
+    def is_normal(self) -> bool:
         return False
 
     @property
-    def inner(self, *, loc=None, ip=None):
+    def inner(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Any:
         return self._inner
 
     @property
-    def offset(self, *, loc=None, ip=None):
+    def offset(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> IntTuple:
         return self._offset
 
     @property
-    def outer(self, *, loc=None, ip=None):
+    def outer(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Layout:
         return self._outer
 
     @property
-    def shape(self, *, loc=None, ip=None):
+    def shape(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Shape:
         return self._outer.shape
 
 
 @dsl_user_op
 def make_composed_layout(
-    inner, offset: IntTuple, outer: Layout, *, loc=None, ip=None
+    inner: Any,
+    offset: IntTuple,
+    outer: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> ComposedLayout:
     """Create a composed layout by composing an inner transformation with an outer layout.
 
@@ -2804,10 +3951,15 @@ def make_composed_layout(
     return _ComposedLayoutWithInnerFunc(inner, offset, outer, loc=loc, ip=ip)
 
 
+@ModeOpDecorator
 @dsl_user_op
 def cosize(
-    a: Union[Layout, ComposedLayout, Tensor], mode: List[int] = [], *, loc=None, ip=None
-):
+    a: Union[Layout, ComposedLayout, Tensor],
+    mode: List[int] = [],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Int:
     """Return size of codomain of layout or tensor. Return static value if type is static.
 
     For a layout ``L = S:D`` where ``S`` is the shape and ``D`` is the stride, the codomain size is the
@@ -2831,7 +3983,7 @@ def cosize(
     :type a: Union[Layout, ComposedLayout, Tensor]
     :param mode: List of mode(s) for cosize calculation. If empty, calculates over all modes.
                 If specified, calculates cosize only for the given modes.
-    :type mode: List[int], optional
+    :type mode: int or list of ints, optional
     :param loc: Location information for diagnostics, defaults to None
     :type loc: optional
     :param ip: Instruction pointer for diagnostics, defaults to None
@@ -2848,21 +4000,24 @@ def cosize(
         res = _cute_ir.cosize(a.value, mode=mode, loc=loc, ip=ip)
     else:
         res = _cute_ir.cosize(a, mode=mode, loc=loc, ip=ip)
-    return _unpack_x_tuple(res, loc=loc, ip=ip)
+    return _unpack_x_tuple(res, loc=loc, ip=ip)  # type: ignore[return-value]
 
 
 @dsl_user_op
 def size_in_bytes(
-    dtype: Type[Numeric],
+    dtype: Union[
+        Type[Numeric],
+    ],
     layout: Union[Layout, ComposedLayout, None],
     *,
-    loc=None,
-    ip=None,
-) -> Union[int, Integer]:
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Int:
     """Calculate the size in bytes based on its data type and layout. The result is rounded up to the nearest byte.
 
+    Supports both regular Numeric types.
     :param dtype: The DSL numeric data type
-    :type dtype: Type[Numeric]
+    :type dtype: Union[Type[Numeric]]
     :param layout: The layout of the elements. If None, the function returns 0
     :type layout: Layout, optional
     :param loc: Location information for diagnostics, defaults to None
@@ -2872,7 +4027,12 @@ def size_in_bytes(
     :return: The total size in bytes. Returns 0 if the layout is None
     :rtype: int
     """
-    if not isinstance(dtype, NumericMeta):
+    if not isinstance(
+        dtype,
+        (
+            NumericMeta,
+        ),
+    ):
         raise TypeError(f"dtype must be a Numeric, but got {dtype}")
 
     size_in_elem = 0
@@ -2893,23 +4053,35 @@ def size_in_bytes(
     else:
         size_in_elem = cosize(layout, loc=loc, ip=ip)
 
-    return ceil_div(size_in_elem * dtype.width, 8, loc=loc, ip=ip)  # type: ignore
+    return ceil_div(size_in_elem * dtype.width, 8, loc=loc, ip=ip)
 
 
 @dsl_user_op
-def coalesce(input, *, target_profile: Coord = None, loc=None, ip=None):
+def coalesce(
+    input: Union[Layout, ComposedLayout, Tensor],
+    *,
+    target_profile: Optional[Coord] = None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout, Tensor]:
     if target_profile:
         profile_val = _pack_coord(target_profile, loc=loc, ip=ip)
     else:
         profile_val = None
 
     return _op_wrapper(
-        partial(_cute_ir.coalesce, target_profile=profile_val, loc=loc, ip=ip), input
+        partial(_cute_ir.coalesce, target_profile=profile_val), input, loc=loc, ip=ip
     )
 
 
 @dsl_user_op
-def crd2idx(coord: Coord, layout, *, loc=None, ip=None):
+def crd2idx(
+    coord: Coord,
+    layout: Union[Layout, ComposedLayout, tuple, int],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Int:
     """
     Convert a multi-dimensional coordinate into a value using the specified layout.
 
@@ -2950,23 +4122,41 @@ def crd2idx(coord: Coord, layout, *, loc=None, ip=None):
         layout = layout.value
 
     res = _cute_ir.crd2idx(crd_val, layout, loc=loc, ip=ip)
-    return _unpack_x_tuple(res, loc=loc, ip=ip)  # type: ignore
+    return _unpack_x_tuple(res, loc=loc, ip=ip)  # type: ignore[return-value]
 
 
 @overload
-def idx2crd(idx: Int, shape: Int, *, loc=None, ip=None) -> Int: ...
+def idx2crd(
+    idx: Int,
+    shape: Int,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Int: ...
 
 
 @overload
-def idx2crd(idx: IntTuple, shape: Tuple, *, loc=None, ip=None) -> Tuple: ...
+def idx2crd(
+    idx: IntTuple,
+    shape: Tuple,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Tuple: ...
 
 
 @dsl_user_op
-def idx2crd(idx, shape, *, loc=None, ip=None):
+def idx2crd(
+    idx: IntTuple,
+    shape: Shape,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> IntTuple:
     """
-    Convert a linear index back into a multi-dimensional coordinate using the specified layout.
+    Convert a linear index back into a nested coordinate using the specified layout.
 
-    Mapping from a linear index to the corresponding multi-dimensional coordinate in the layout's coordinate space.
+    Mapping from a linear index to the corresponding nested coordinate in the layout's coordinate space.
     It essentially "unfolds" a linear index into its constituent coordinate components.
 
     :param idx: The linear index to convert back to coordinates.
@@ -2987,13 +4177,13 @@ def idx2crd(idx, shape, *, loc=None, ip=None):
         import cutlass.cute as cute
         @cute.jit
         def foo():
-            coord = cute.idx2crd(11, (5,4))
-            # Computed as: 11 = 2 * 4 + 3, so coordinate is (2, 3)
-            print(coord)
-        foo()  # Expected output: (2, 3)
+            coord = cute.idx2crd(11, (5, 4))
+            # idx2crd is always lexicographical ordering (left-to-right)
+            # For shape (m, n, l, ...), coord = (idx % m, idx // m % n, idx // m // n % l, ...
+            # Computed as: (11 % 5, 11 // 5 % 4) = (1, 2)
+            cute.printf("coord: {}", coord)
 
-    **Note:**
-        Python DSL is aligned with C++ DSL.
+        foo()  # Expected output: (1, 2)
     """
     if is_integer(idx) and is_integer(shape):
         return idx
@@ -3004,16 +4194,120 @@ def idx2crd(idx, shape, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def recast_layout(new_type_bits, old_type_bits, src_layout, *, loc=None, ip=None):
+def increment_coord(
+    coord: Coord,
+    shape: Shape,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Coord:
+    """
+    Colexicographically increment a coordinate within a coordinate space defined by a shape.
+
+    Increments the leftmost mode first. When a mode reaches its
+    shape limit, it wraps to 0 and carries to the next mode.
+
+    :param coord: The coordinate to increment.
+    :type coord: Coord
+    :param shape: The shape defining the coordinate space bounds.
+    :type shape: Shape
+    :param loc: Optional location information for IR diagnostics.
+    :type loc: optional
+    :param ip: Optional instruction pointer or context for underlying IR functions.
+    :type ip: optional
+    :returns: The incremented coordinate.
+    :rtype: Coord
+    :raises ValueError: If the coordinate and shape are not congruent or if the coordinate contains an underscore.
+
+    **Example:**
+
+    .. code-block:: python
+
+        import cutlass.cute as cute
+        @cute.jit
+        def foo():
+            coord = cute.increment_coord((2, 0, 0), (3, 3, 3))
+            # Increments colexicographically: (2,0,0) -> (0,1,0)
+            cute.printf("coord: {}", coord)
+        foo()  # Expected output: coord: (0, 1, 0)
+    """
+    if has_underscore(coord):
+        raise ValueError("coord cannot contain underscores")
+    if not is_congruent(coord, shape):
+        raise ValueError("coord and shape must be congruent")
+
+    coord_val = _pack_coord(coord, loc=loc, ip=ip)
+    shape_val = _pack_shape(shape, loc=loc, ip=ip)
+    res = _cute_ir.increment_coord(coord_val, shape_val, loc=loc, ip=ip)
+    return _unpack_x_tuple(res, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def recast_layout(
+    new_type_bits: int,
+    old_type_bits: int,
+    src_layout: Union[Layout, ComposedLayout],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout]:
+    """
+    Recast a layout from one data type to another.
+
+    :param new_type_bits: The new data type bits
+    :type new_type_bits: int
+    :param old_type_bits: The old data type bits
+    :type old_type_bits: int
+    :param src_layout: The layout to recast
+    :type src_layout: Union[Layout, ComposedLayout]
+    :param loc: Optional location information for IR diagnostics.
+    :type loc: optional
+    :param ip: Optional instruction pointer or context for underlying IR functions.
+    :type ip: optional
+    :return: The recast layout
+    :rtype: Layout or ComposedLayout
+
+    **Example:**
+
+    .. code-block:: python
+
+        import cutlass.cute as cute
+        @cute.jit
+        def foo():
+            # Create a layout
+            L = cute.make_layout((2, 3, 4))
+            # Recast the layout to a different data type
+            L_recast = cute.recast_layout(16, 8, L)
+            print(L_recast)
+        foo()  # Expected output: (2, 3, 4)
+    """
+    if not isinstance(new_type_bits, int):
+        raise TypeError(
+            f"new_type_bits must be an integer instead got {type(new_type_bits)}"
+        )
+    if not isinstance(old_type_bits, int):
+        raise TypeError(
+            f"old_type_bits must be an integer instead got {type(old_type_bits)}"
+        )
+    if not isinstance(src_layout, (Layout, ComposedLayout)):
+        raise TypeError(
+            f"src_layout must be a layout or composed layout instead got {type(src_layout)}"
+        )
     if isinstance(src_layout, _ComposedLayout):
         src_layout = src_layout.value
     return _cute_ir.recast_layout(
         new_type_bits, old_type_bits, src_layout, loc=loc, ip=ip
-    )  # type: ignore
+    )
 
 
 @dsl_user_op
-def slice_and_offset(coord, src, *, loc=None, ip=None):
+def slice_and_offset(
+    coord: Coord,
+    src: Union[Layout, ComposedLayout],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> tuple:
     layout = slice_(src, coord, loc=loc, ip=ip)
     offset = crd2idx(coord, src, loc=loc, ip=ip)
     return layout, offset
@@ -3022,7 +4316,11 @@ def slice_and_offset(coord, src, *, loc=None, ip=None):
 @dsl_user_op
 @lru_cache_ir()
 def shape(
-    input: Union[Shape, Tensor, Layout, Tile], *, mode=None, loc=None, ip=None
+    input: Union[Shape, Tensor, Layout, Tile],
+    *,
+    mode: Optional[int] = None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Shape:
     """Returns the shape of a tensor, layout or tiler.
 
@@ -3077,56 +4375,59 @@ def shape(
 @dsl_user_op
 def recast_ptr(
     ptr: Pointer,
-    swizzle_=None,
+    swizzle_: Optional[Swizzle] = None,
     dtype: Optional[Type[Numeric]] = None,
-    loc=None,
-    ip=None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Pointer:
+    cvt_ty = None
     if dtype is not None:
-        if isinstance(dtype, _cute_ir.SparseElemType):
-            # use SparseElemType as dtype
-            pass
-        else:
+        if cvt_ty is None:
             if not isclass(dtype) or not issubclass(dtype, Numeric):
                 raise TypeError(f"dtype must be a type of Numeric, but got {dtype}")
-            dtype = dtype.mlir_type
+            cvt_ty = T.i8() if dtype is Boolean else dtype.mlir_type
 
-    value_type = ptr.type.value_type if dtype is None else dtype
-    swizzle = swizzle_.type.attribute if swizzle_ is not None else None
-    res_ty = _cute_ir.PtrType.get(value_type, ptr.memspace, ptr.alignment, swizzle)
+    value_ty = cvt_ty or ptr.type.value_type
+    swizzle_attr = swizzle_.type.attribute if swizzle_ is not None else None
+    res_ty = _cute_ir.PtrType.get(
+        value_ty, _to_mlir_address_space(ptr.memspace), ptr.alignment, swizzle_attr
+    )
     return _cute_ir.recast_iter(res_ty, ptr.value, loc=loc, ip=ip)
 
 
 @dsl_user_op
 def make_ptr(
-    dtype: Union[Type[Numeric], None],
-    value,
-    mem_space: AddressSpace = AddressSpace.generic,
+    dtype: Union[Type[Numeric], _SparseElemType],
+    value: Union[int, Integer, ir.Value],
+    mem_space: Optional[AddressSpace] = None,
     *,
-    assumed_align=None,
-    loc=None,
-    ip=None,
+    assumed_align: Optional[int] = None,
+    swizzle_: Optional[Swizzle] = None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Pointer:
-    if dtype is None or not isinstance(dtype, NumericMeta):
-        raise TypeError(f"expects dtype to be a type of Numeric, but got {dtype}")
-
-    if not isinstance(mem_space, AddressSpace):
-        raise TypeError(f"expects mem_space to be an AddressSpace, but got {mem_space}")
-
-    if isinstance(value, ir.Value) and llvm.PointerType.isinstance(value.type):
-        value = llvm.ptrtoint(T.i64(), value)
-
-    if not isinstance(mem_space, AddressSpace):
-        raise TypeError(f"expects mem_space to be an AddressSpace, but got {mem_space}")
-
-    if isinstance(value, ir.Value) and llvm.PointerType.isinstance(value.type):
+    cvt_type: Union[_SparseElemType, ir.Type, None] = None
+    if cvt_type is None:
+        if not isinstance(dtype, NumericMeta):
+            raise TypeError("expects dtype to be a type of Numeric")
+        cvt_type = dtype.mlir_type
+    if isinstance(value, ir.Value) and isinstance(value.type, llvm.PointerType):
+        llvm_ptr_ty = llvm.PointerType(value.type)
+        mem_space = AddressSpace(llvm_ptr_ty.address_space)
         value = llvm.ptrtoint(T.i64(), value)
 
     if not is_integer(value):
         raise TypeError(f"expects integer value, but got {type(value)}")
-    value = Int32(value) if mem_space == AddressSpace.tmem else Int64(value)
-    value = Int32(value) if mem_space == AddressSpace.tmem else Int64(value)
 
+    if mem_space is None:
+        mem_space = AddressSpace.generic
+    mem_space = _as_address_space(mem_space)
+
+    # TMEM addresses are 32b wide
+    is_tmem = mem_space == AddressSpace.tmem
+    value = Int32(value) if is_tmem else Int64(value)
+
+    # Set the alignment of the pointer
     bytes_per_elt = max(1, dtype.width // 8)
     if assumed_align is None:
         assumed_align = bytes_per_elt
@@ -3141,9 +4442,16 @@ def make_ptr(
         aligned_ty, value.ir_value(loc=loc, ip=ip), loc=loc, ip=ip
     )
 
-    data_ty = T.i8() if dtype is None else dtype.mlir_type
-    ptr_ty = _cute_ir.PtrType.get(data_ty, mem_space, assumed_align)
-    return _cute_ir.inttoptr(ptr_ty, aligned_intptr, loc=loc, ip=ip)
+    # Construct the pointer Type
+    data_ty = cvt_type
+    swizzle = swizzle_.type.attribute if swizzle_ is not None else None
+
+    ptr_ty = _cute_ir.PtrType.get(
+        data_ty, _to_mlir_address_space(mem_space), assumed_align, swizzle
+    )
+    ptr = _cute_ir.inttoptr(ptr_ty, aligned_intptr, loc=loc, ip=ip)
+    ptr._dtype = dtype
+    return ptr
 
 
 #
@@ -3153,20 +4461,38 @@ def make_ptr(
 
 @overload
 def composition(
-    lhs: Layout, rhs: Union[Layout, Shape, Tile], *, loc=None, ip=None
+    lhs: Layout,
+    rhs: Union[Layout, Shape, Tile],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Layout: ...
 @overload
 def composition(
-    lhs: ComposedLayout, rhs: Union[Layout, Shape, Tile], *, loc=None, ip=None
+    lhs: ComposedLayout,
+    rhs: Union[Layout, Shape, Tile],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> ComposedLayout: ...
 @overload
 def composition(
-    lhs: Tensor, rhs: Union[Layout, Shape, Tile], *, loc=None, ip=None
+    lhs: Tensor,
+    rhs: Union[Layout, Shape, Tile],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Tensor: ...
 
 
 @dsl_user_op
-def composition(lhs, rhs: Union[Layout, Shape, Tile], *, loc=None, ip=None):
+def composition(
+    lhs: Union[Layout, ComposedLayout, Tensor],
+    rhs: Union[Layout, Shape, Tile],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout, Tensor]:
     """
     Compose two layout representations using the CuTe layout algebra.
 
@@ -3222,7 +4548,11 @@ def composition(lhs, rhs: Union[Layout, Shape, Tile], *, loc=None, ip=None):
 
 @dsl_user_op
 def complement(
-    input: Layout, cotarget: Union[Layout, Shape], *, loc=None, ip=None
+    input: Layout,
+    cotarget: Union[Layout, Shape],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Layout:
     """
     Compute the complement layout of the input layout with respect to the cotarget.
@@ -3266,7 +4596,12 @@ def complement(
 
 
 @dsl_user_op
-def right_inverse(input: Layout, *, loc=None, ip=None) -> Layout:
+def right_inverse(
+    input: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout:
     if not isinstance(input, Layout):
         raise TypeError(f"Expected input of type Layout, but got {type(input)}")
 
@@ -3274,7 +4609,12 @@ def right_inverse(input: Layout, *, loc=None, ip=None) -> Layout:
 
 
 @dsl_user_op
-def left_inverse(input: Layout, *, loc=None, ip=None) -> Layout:
+def left_inverse(
+    input: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout:
     if not isinstance(input, Layout):
         raise TypeError(f"Expected input of type Layout, but got {type(input)}")
 
@@ -3282,15 +4622,31 @@ def left_inverse(input: Layout, *, loc=None, ip=None) -> Layout:
 
 
 @overload
-def logical_product(block: Layout, tiler: Tile, *, loc=None, ip=None) -> Layout: ...
+def logical_product(
+    block: Layout,
+    tiler: Tile,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
 @overload
 def logical_product(
-    block: ComposedLayout, tiler: Tile, *, loc=None, ip=None
+    block: ComposedLayout,
+    tiler: Tile,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> ComposedLayout: ...
 
 
 @dsl_user_op
-def logical_product(block, tiler: Tile, *, loc=None, ip=None):
+def logical_product(
+    block: Union[Layout, ComposedLayout],
+    tiler: Tile,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout]:
     if isinstance(block, _ComposedLayout):
         block = block.value
 
@@ -3306,8 +4662,9 @@ def logical_product(block, tiler: Tile, *, loc=None, ip=None):
     assert rank(tiler_val) <= rank(block), "logical_product: Too many modes in tiler."
     tiler_rank = rank(tiler_val)
     block_rank = rank(block)
+    assert isinstance(tiler_val, tuple)
     res = tuple(
-        logical_product(block[i], tiler_val[i]) if i < tiler_rank else block[i]
+        logical_product(block[i], tiler_val[i]) if i < tiler_rank else block[i]  # type: ignore[index]
         for i in range(block_rank)
     )
 
@@ -3317,15 +4674,31 @@ def logical_product(block, tiler: Tile, *, loc=None, ip=None):
 
 
 @overload
-def zipped_product(block: Layout, tiler: Layout, *, loc=None, ip=None) -> Layout: ...
+def zipped_product(
+    block: Layout,
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
 @overload
 def zipped_product(
-    block: ComposedLayout, tiler: Layout, *, loc=None, ip=None
+    block: ComposedLayout,
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> ComposedLayout: ...
 
 
 @dsl_user_op
-def zipped_product(block, tiler: Layout, *, loc=None, ip=None):
+def zipped_product(
+    block: Union[Layout, ComposedLayout],
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout]:
     if isinstance(block, _ComposedLayout):
         return _cute_ir.zipped_product(input=block.value, tiler=tiler, loc=loc, ip=ip)
     else:
@@ -3333,15 +4706,31 @@ def zipped_product(block, tiler: Layout, *, loc=None, ip=None):
 
 
 @overload
-def tiled_product(block: Layout, tiler: Layout, *, loc=None, ip=None) -> Layout: ...
+def tiled_product(
+    block: Layout,
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
 @overload
 def tiled_product(
-    block: ComposedLayout, tiler: Layout, *, loc=None, ip=None
+    block: ComposedLayout,
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> ComposedLayout: ...
 
 
 @dsl_user_op
-def tiled_product(block, tiler: Layout, *, loc=None, ip=None):
+def tiled_product(
+    block: Union[Layout, ComposedLayout],
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout]:
     if isinstance(block, _ComposedLayout):
         return _cute_ir.tiled_product(input=block.value, tiler=tiler, loc=loc, ip=ip)
     else:
@@ -3349,15 +4738,31 @@ def tiled_product(block, tiler: Layout, *, loc=None, ip=None):
 
 
 @overload
-def flat_product(block: Layout, tiler: Layout, *, loc=None, ip=None) -> Layout: ...
+def flat_product(
+    block: Layout,
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
 @overload
 def flat_product(
-    block: ComposedLayout, tiler: Layout, *, loc=None, ip=None
+    block: ComposedLayout,
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> ComposedLayout: ...
 
 
 @dsl_user_op
-def flat_product(block, tiler: Layout, *, loc=None, ip=None):
+def flat_product(
+    block: Union[Layout, ComposedLayout],
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout]:
     if isinstance(block, _ComposedLayout):
         return _cute_ir.flat_product(input=block.value, tiler=tiler, loc=loc, ip=ip)
     else:
@@ -3365,15 +4770,31 @@ def flat_product(block, tiler: Layout, *, loc=None, ip=None):
 
 
 @overload
-def raked_product(block: Layout, tiler: Layout, *, loc=None, ip=None) -> Layout: ...
+def raked_product(
+    block: Layout,
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
 @overload
 def raked_product(
-    block: ComposedLayout, tiler: Layout, *, loc=None, ip=None
+    block: ComposedLayout,
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> ComposedLayout: ...
 
 
 @dsl_user_op
-def raked_product(block, tiler: Layout, *, loc=None, ip=None):
+def raked_product(
+    block: Union[Layout, ComposedLayout],
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout]:
     if isinstance(block, _ComposedLayout):
         return _cute_ir.raked_product(input=block.value, tiler=tiler, loc=loc, ip=ip)
     else:
@@ -3381,15 +4802,31 @@ def raked_product(block, tiler: Layout, *, loc=None, ip=None):
 
 
 @overload
-def blocked_product(block: Layout, tiler: Layout, *, loc=None, ip=None) -> Layout: ...
+def blocked_product(
+    block: Layout,
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
 @overload
 def blocked_product(
-    block: ComposedLayout, tiler: Layout, *, loc=None, ip=None
+    block: ComposedLayout,
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> ComposedLayout: ...
 
 
 @dsl_user_op
-def blocked_product(block, tiler: Layout, *, loc=None, ip=None):
+def blocked_product(
+    block: Union[Layout, ComposedLayout],
+    tiler: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout]:
     if isinstance(block, _ComposedLayout):
         return _cute_ir.blocked_product(input=block.value, tiler=tiler, loc=loc, ip=ip)
     else:
@@ -3397,73 +4834,183 @@ def blocked_product(block, tiler: Layout, *, loc=None, ip=None):
 
 
 @overload
-def logical_divide(target: Layout, tiler: Tiler, *, loc=None, ip=None) -> Layout: ...
+def logical_divide(
+    target: Layout,
+    tiler: Tiler,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
 @overload
-def logical_divide(target: Tensor, tiler: Tiler, *, loc=None, ip=None) -> Tensor: ...
+def logical_divide(
+    target: Tensor,
+    tiler: Tiler,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Tensor: ...
 
 
 @dsl_user_op
-def logical_divide(target, tiler: Tiler, *, loc=None, ip=None):
-    if isinstance(tiler, tuple):
-        tiler = _pack_tile(tiler, loc=loc, ip=ip)  # type: ignore
+def logical_divide(
+    target: Union[Layout, Tensor],
+    tiler: Tiler,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, Tensor]:
+    if isinstance(tiler, (int, tuple)):
+        tiler = _pack_tile(tiler, loc=loc, ip=ip)
     return _op_wrapper(
-        partial(_cute_ir.logical_divide, tiler=tiler, loc=loc, ip=ip), target
+        partial(_cute_ir.logical_divide, tiler=tiler), target, loc=loc, ip=ip
     )
 
 
 @overload
-def zipped_divide(target: Layout, tiler: Tiler, *, loc=None, ip=None) -> Layout: ...
+def zipped_divide(
+    target: Layout,
+    tiler: Tiler,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
 @overload
-def zipped_divide(target: Tensor, tiler: Tiler, *, loc=None, ip=None) -> Tensor: ...
+def zipped_divide(
+    target: Tensor,
+    tiler: Tiler,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Tensor: ...
 
 
 @dsl_user_op
-def zipped_divide(target, tiler: Tiler, *, loc=None, ip=None):
-    if isinstance(tiler, tuple):
-        tiler = _pack_tile(tiler, loc=loc, ip=ip)  # type: ignore
-    return _op_wrapper(
-        partial(_cute_ir.zipped_divide, tiler=tiler, loc=loc, ip=ip), target
-    )
+def zipped_divide(
+    target: Union[Layout, Tensor],
+    tiler: Tiler,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, Tensor]:
+    """
+    ``zipped_divide`` is ``logical_divide`` with Tiler modes and Rest modes gathered together: ``(Tiler,Rest)``
 
+    - When Tiler is Layout, this has no effect as ``logical_divide`` results in the same.
+    - When Tiler is ``Tile`` (nested tuple of ``Layout``) or ``Shape``, this zips modes into standard form
+      ``((BLK_A,BLK_B),(a,b,x,y))``
 
-@overload
-def tiled_divide(target: Layout, tiler: Tiler, *, loc=None, ip=None) -> Layout: ...
-@overload
-def tiled_divide(target: Tensor, tiler: Tiler, *, loc=None, ip=None) -> Tensor: ...
+    For example, if ``target`` has shape ``(s, t, r)`` and ``tiler`` has shape ``(BLK_A, BLK_B)``,
+    then the result will have shape ``((BLK_A, BLK_B), (ceil_div(s, BLK_A), ceil_div(t, BLK_B), r))``.
 
+    :param target: The layout or tensor to partition.
+    :type target: Layout or Tensor
+    :param tiler: The tiling specification (can be a Layout, Shape, Tile).
+    :type tiler: Tiler
+    :param loc: Optional MLIR IR location information.
+    :type loc: optional
+    :param ip: Optional MLIR IR insertion point.
+    :type ip: optional
+    :return: A zipped (partitioned) version of the target.
+    :rtype: Layout or Tensor
 
-@dsl_user_op
-def tiled_divide(target, tiler: Tiler, *, loc=None, ip=None):
+    **Example:**
+
+    .. code-block:: python
+
+        layout = cute.make_layout((128, 64), stride=(64, 1))
+        tiler = (8, 8)
+        result = cute.zipped_divide(layout, tiler)  # result shape: ((8, 8), (16, 8))
+    """
+    if not isinstance(tiler, Layout) and rank(target) < rank(tiler):
+        raise ValueError(
+            f"Expected rank(target) >= rank(tiler), but got rank(target)={rank(target)} and rank(tiler)={rank(tiler)}"
+        )
+
     if isinstance(tiler, tuple):
         tiler = _pack_tile(tiler, loc=loc, ip=ip)
     return _op_wrapper(
-        partial(_cute_ir.tiled_divide, tiler=tiler, loc=loc, ip=ip), target
+        partial(_cute_ir.zipped_divide, tiler=tiler), target, loc=loc, ip=ip
     )
 
 
 @overload
-def flat_divide(target: Layout, tiler: Tile, *, loc=None, ip=None) -> Layout: ...
+def tiled_divide(
+    target: Layout,
+    tiler: Tiler,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
 @overload
-def flat_divide(target: Tensor, tiler: Tile, *, loc=None, ip=None) -> Tensor: ...
+def tiled_divide(
+    target: Tensor,
+    tiler: Tiler,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Tensor: ...
 
 
 @dsl_user_op
-def flat_divide(target, tiler: Tile, *, loc=None, ip=None):
+def tiled_divide(
+    target: Union[Layout, Tensor],
+    tiler: Tiler,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, Tensor]:
     if isinstance(tiler, tuple):
         tiler = _pack_tile(tiler, loc=loc, ip=ip)
     return _op_wrapper(
-        partial(_cute_ir.flat_divide, tiler=tiler, loc=loc, ip=ip), target
+        partial(_cute_ir.tiled_divide, tiler=tiler), target, loc=loc, ip=ip
+    )
+
+
+@overload
+def flat_divide(
+    target: Layout,
+    tiler: Tile,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout: ...
+@overload
+def flat_divide(
+    target: Tensor,
+    tiler: Tile,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Tensor: ...
+
+
+@dsl_user_op
+def flat_divide(
+    target: Union[Layout, Tensor],
+    tiler: Tile,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, Tensor]:
+    if isinstance(tiler, tuple):
+        tiler = _pack_tile(tiler, loc=loc, ip=ip)
+    return _op_wrapper(
+        partial(_cute_ir.flat_divide, tiler=tiler), target, loc=loc, ip=ip
     )
 
 
 #
-# Higher-level utilties
+# Higher-level utilities
 #
 
 
 @dsl_user_op
 def max_common_layout(
-    a: Union[Layout, Tensor], b: Union[Layout, Tensor], *, loc=None, ip=None
+    a: Union[Layout, Tensor],
+    b: Union[Layout, Tensor],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Layout:
     from .tensor import _Tensor
 
@@ -3486,7 +5033,11 @@ def max_common_layout(
 
 @dsl_user_op
 def max_common_vector(
-    a: Union[Layout, Tensor], b: Union[Layout, Tensor], *, loc=None, ip=None
+    a: Union[Layout, Tensor],
+    b: Union[Layout, Tensor],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> int:
     from .tensor import _Tensor
 
@@ -3509,18 +5060,35 @@ def max_common_vector(
 
 @overload
 def tile_to_shape(
-    atom: Layout, trg_shape: Shape, order: Shape, *, loc=None, ip=None
+    atom: Layout,
+    trg_shape: Shape,
+    order: Shape,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Layout: ...
 @overload
 def tile_to_shape(
-    atom: ComposedLayout, trg_shape: Shape, order: Shape, *, loc=None, ip=None
+    atom: ComposedLayout,
+    trg_shape: Shape,
+    order: Shape,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> ComposedLayout: ...
 
 
 @dsl_user_op
-def tile_to_shape(atom, trg_shape: Shape, order: Shape, *, loc=None, ip=None):
-    trg_shape = _pack_shape(shape(trg_shape), loc=loc, ip=ip)  # type: ignore
-    order = _pack_int_tuple(order, loc=loc, ip=ip)  # type: ignore
+def tile_to_shape(
+    atom: Union[Layout, ComposedLayout],
+    trg_shape: Shape,
+    order: Shape,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout]:
+    trg_shape = _pack_shape(shape(trg_shape), loc=loc, ip=ip)
+    order = _pack_int_tuple(order, loc=loc, ip=ip)
 
     if isinstance(atom, _ComposedLayout):
         return _cute_ir.tile_to_shape(atom.value, trg_shape, order, loc=loc, ip=ip)
@@ -3535,19 +5103,22 @@ def local_partition(
     index: Union[int, Numeric],
     proj: XTuple = 1,
     *,
-    loc=None,
-    ip=None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Tensor:
     if isinstance(index, cutlass_arith.ArithValue):
         index_val = index
     else:
-        index_val = index.ir_value(loc=loc, ip=ip)
+        index_val = index.ir_value(loc=loc, ip=ip)  # type: ignore[union-attr]
     if index_val.type.width > 32:
         raise NotImplementedError(
             f"Index value should be 32-bit or smaller integer type, but got {index_val.type}"
         )
-    return _cute_ir.local_partition(
-        input=target.value, tiler=dice(tiler, proj), index=index_val, loc=loc, ip=ip
+    return _op_wrapper(
+        partial(_cute_ir.local_partition, tiler=dice(tiler, proj), index=index_val),
+        target,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -3556,11 +5127,78 @@ def local_tile(
     input: Tensor,
     tiler: Tiler,
     coord: Coord,
-    proj: XTuple = None,  # type: ignore
+    proj: XTuple = None,
     *,
-    loc=None,
-    ip=None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Tensor:
+    """
+    Partition a tensor into tiles using a tiler and extract a single tile at the provided coordinate.
+
+    The ``local_tile`` operation applies a ``zipped_divide`` to split the ``input`` tensor by the ``tiler``
+    and then slices out a single tile using the provided `coord`. This is commonly used for extracting block-,
+    thread-, or CTA-level tiles for parallel operations.
+
+    .. math::
+
+        \\text{local_tile}(input, tiler, coord) = \\text{zipped_divide}(input, tiler)[coord]
+
+    This function corresponds to the CUTE/C++ `local_tile` utility:
+    https://docs.nvidia.com/cutlass/media/docs/cpp/cute/03_tensor.html#local-tile
+
+    :param input: The input tensor to partition into tiles.
+    :type input: Tensor
+    :param tiler: The tiling specification (can be a Layout, Shape, Tile).
+    :type tiler: Tiler
+    :param coord: The coordinate to select within the remainder ("rest") modes after tiling.
+                 This selects which tile to extract.
+    :type coord: Coord
+    :param proj: (Optional) Projection onto tiling modes; specify to project out unused tiler modes,
+                 e.g., when working with projections of tilers in multi-mode partitioning.
+                 Default is None for no projection.
+    :type proj: XTuple, optional
+    :param loc: (Optional) MLIR location, for diagnostic/debugging.
+    :type loc: Any, optional
+    :param ip: (Optional) MLIR insertion point, used in IR building context.
+    :type ip: Any, optional
+
+    :return: A new tensor representing the local tile selected at the given coordinate.
+    :rtype: Tensor
+
+    **Examples**
+
+    1. Tiling a 2D tensor and extracting a tile:
+
+        .. code-block:: python
+
+            # input: (16, 24)
+            tensor : cute.Tensor
+            tiler = (2, 4)
+            coord = (1, 1)
+
+            # output: (8, 6)
+            # - zipped_divide(tensor, tiler)     -> ((2, 4), (8, 6))
+            # - local_tile(tensor, tiler, coord) -> (8, 6)
+            result = cute.local_tile(tensor, tiler=tiler, coord=coord)
+
+    2. Using a stride projection for specialized tiling:
+
+        .. code-block:: python
+
+            # input: (16, 24)
+            tensor : cute.Tensor
+            tiler = (2, 2, 4)
+            coord = (0, 1, 1)
+            proj = (1, None, 1)
+
+            # output: (8, 6)
+            # projected_tiler: (2, 4)
+            # projected_coord: (0, 1)
+            # - zipped_divide(tensor, projected_tiler)               -> ((2, 4), (8, 6))
+            # - local_tile(tensor, projected_tiler, projected_coord) -> (8, 6)
+            result = cute.local_tile(tensor, tiler=tiler, coord=coord, proj=proj)
+    """
+
     tiler_val = _pack_tile(tiler, loc=loc, ip=ip)
     coord_val = _pack_coord(coord, loc=loc, ip=ip)
     if proj is not None:
@@ -3569,13 +5207,9 @@ def local_tile(
         proj_val = _pack_coord(proj, loc=loc, ip=ip)
         proj = proj_val.type.attribute
 
-    return _cute_ir.local_tile(
-        input=input.value,
-        tile=tiler_val,
-        static_tile=None,
-        coord=coord_val,
-        static_coord=None,
-        proj=proj,
+    return _op_wrapper(
+        partial(_cute_ir.local_tile, tile=tiler_val, coord=coord_val, proj=proj),
+        input,
         loc=loc,
         ip=ip,
     )
@@ -3583,7 +5217,12 @@ def local_tile(
 
 @dsl_user_op
 def make_layout_image_mask(
-    lay: Layout, coord: Coord, mode: int, *, loc=None, ip=None
+    lay: Layout,
+    coord: Coord,
+    mode: int,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Int16:
     """
     Makes a 16-bit integer mask of the image of a layout sliced at a given mode
@@ -3606,24 +5245,24 @@ def make_layout_image_mask(
         raise ValueError("the mask may not fit into a 16-bit integer")
 
     # Replace the mode to keep with _ in the coordinate
-    slicer = tuple(None if idx == mode else x for idx, x in enumerate(coord))
+    slicer = tuple(None if idx == mode else x for idx, x in enumerate(coord))  # type: ignore[arg-type]
     # Slice the layout with the slicer above and keep track of the offset
     sliced_lay, offset = slice_and_offset(slicer, lay, loc=loc, ip=ip)
     # Given that we replace only one mode with _, the rank of the slice should be 1
     assert rank(sliced_lay) == 1
-
-    if not is_static(sliced_lay):
-        raise ValueError("make_layout_image_mask requires the layout to be static")
+    assert is_static(sliced_lay), (
+        "make_layout_image_mask requires the layout to be static"
+    )
 
     # Create the mask of the image
     mcast_mask = Int16(0)
-    for i in range(size(sliced_lay)):  # type: ignore
+    for i in range(size(sliced_lay)):
         mcast_mask = mcast_mask | (1 << sliced_lay(i))
     mcast_mask <<= offset
     return Int16(mcast_mask)
 
 
-def leading_dim(shape: Shape, stride: Stride) -> Union[int, Tuple[int, ...], None]:  # type: ignore
+def leading_dim(shape: Shape, stride: Stride) -> Union[int, Tuple[int, ...], None]:
     """
     Find the leading dimension of a shape and stride.
 
@@ -3641,7 +5280,7 @@ def leading_dim(shape: Shape, stride: Stride) -> Union[int, Tuple[int, ...], Non
         * If no leading dimension is found, returns None
     """
 
-    def pred_fn(val, pos):
+    def pred_fn(val: object, pos: Union[int, tuple]) -> bool:
         # skip dynamic values which can't be compared
         # find the candidate target val, stride at this position is 1
         if (not is_dynamic_expression(val)) and (val == 1):
@@ -3659,7 +5298,11 @@ def leading_dim(shape: Shape, stride: Stride) -> Union[int, Tuple[int, ...], Non
 
 @dsl_user_op
 def make_layout_tv(
-    thr_layout: Layout, val_layout: Layout, *, loc=None, ip=None
+    thr_layout: Layout,
+    val_layout: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Tuple[Shape, Layout]:
     """Create a thread-value layout by repeating the val_layout over the thr_layout.
 
@@ -3734,9 +5377,135 @@ def make_layout_tv(
         right_inverse(layout_mn, loc=loc, ip=ip), tmp, loc=loc, ip=ip
     )
 
-    tiler_mn = product_each(layout_mn.shape, loc=loc, ip=ip)
+    tiler_mn = product_each(layout_mn.shape_method(loc=loc, ip=ip), loc=loc, ip=ip)
 
     return (tiler_mn, layout_tv)
+
+
+@dsl_user_op
+def get_nonswizzle_portion(
+    layout: Union[Layout, ComposedLayout],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Union[Layout, ComposedLayout]:
+    """
+    Extract the non-swizzle portion from a layout.
+
+    For a simple Layout, the entire layout is considered non-swizzled and is returned as-is.
+    For a ComposedLayout, the inner layout (non-swizzled portion) is extracted and returned,
+    effectively separating the base layout from any swizzle transformation that may be applied.
+
+    :param layout: A Layout or ComposedLayout from which to extract the non-swizzle portion.
+    :type layout: Union[Layout, ComposedLayout]
+    :param loc: Optional location information for IR diagnostics.
+    :type loc: optional
+    :param ip: Optional
+    :type ip: optional
+    :returns: The non-swizzle portion of the input layout. For Layout objects, returns the layout itself.
+              For ComposedLayout objects, returns the outer layout component.
+    :rtype: Layout
+    :raises TypeError: If the layout is neither a Layout nor a ComposedLayout.
+    """
+    if isinstance(layout, Layout):
+        return layout
+    elif isinstance(layout, ComposedLayout):
+        return layout.outer
+    else:
+        raise TypeError(f"expects a Layout or ComposedLayout, but got {type(layout)}")
+
+
+@dsl_user_op
+def get_swizzle_portion(
+    layout: Union[Layout, ComposedLayout],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Swizzle:
+    """
+    Extract or create the swizzle portion from a layout.
+
+    For a simple Layout (which has no explicit swizzle), a default identity swizzle is created.
+    For a ComposedLayout, the outer layout is checked and returned if it is a Swizzle object.
+    Otherwise, a default identity swizzle is created. The default identity swizzle has parameters
+    (0, 4, 3), which represents a no-op swizzle transformation.
+
+    :param layout: A Layout or ComposedLayout from which to extract the swizzle portion.
+    :type layout: Union[Layout, ComposedLayout]
+    :param loc: Optional location information for IR diagnostics.
+    :type loc: optional
+    :param ip: Optional
+    :type ip: optional
+    :returns: The swizzle portion of the layout. For Layout objects or ComposedLayout objects without
+              a Swizzle outer component, returns a default identity swizzle (0, 4, 3). For ComposedLayout
+              objects with a Swizzle outer component, returns that swizzle.
+    :rtype: Swizzle
+    :raises TypeError: If the layout is neither a Layout nor a ComposedLayout.
+    """
+    if isinstance(layout, Layout):
+        return make_swizzle(0, 4, 3, loc=loc, ip=ip)
+    elif isinstance(layout, ComposedLayout):
+        if isinstance(layout.inner, Swizzle):
+            return layout.inner
+        else:
+            return make_swizzle(0, 4, 3, loc=loc, ip=ip)
+    else:
+        raise TypeError(f"expects a Layout or ComposedLayout, but got {type(layout)}")
+
+
+@dsl_user_op
+def nullspace(
+    layout: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout:
+    """
+    Computes the nullspace (kernel) of a layout.
+
+    Returns a layout l such that layout(l(i)) == 0 for all i < size(l),
+    nullspace(l) == make_layout(1, stride=0),
+    and size(l) == size(layout) / size(filter_zeros(layout))
+
+    :param layout: The layout to compute the nullspace of.
+    :type layout: Layout
+    :param loc: Optional location information for IR diagnostics.
+    :type loc: optional
+    :param ip: Optional
+    :type ip: optional
+    :returns: The nullspace of the layout
+    :rtype: Layout
+    :raises TypeError: If the layout is not a Layout.
+    """
+
+    if not isinstance(layout, Layout):
+        raise TypeError(f"expects a Layout, but got {type(layout)}")
+
+    # Select all indices corresponds to stride 0
+    flat_stride = wrap(flatten(layout.stride))
+
+    # Transform to get tuple of zeros and get the indices that are non zero
+    nullspace_indices = []
+    for i in range(len(flat_stride)):
+        if is_static(flat_stride[i]) and flat_stride[i] == 0:
+            nullspace_indices.append(i)
+
+    if len(nullspace_indices) == 0:
+        return make_layout(1, stride=0, loc=loc, ip=ip)
+    else:
+        flat_shape = flatten(shape(layout))
+        # create a compact major left stride based on the flat shape
+        rstride = [1] * len(flat_shape)
+        for i in range(1, len(flat_shape)):
+            rstride[i] = flat_shape[i - 1] * rstride[i - 1]
+
+        # Select all indices that map to 0
+        return make_layout(
+            unwrap(tuple(flat_shape[i] for i in nullspace_indices)),
+            stride=unwrap(tuple(rstride[i] for i in nullspace_indices)),
+            loc=loc,
+            ip=ip,
+        )
 
 
 ##############################################################################
@@ -3787,8 +5556,8 @@ class struct:
         storage = allocator.allocate(StorageB)
 
         storage.a[0] ...
-        storage.x ...
-        storage.compA.real ...
+        storage.x.ptr ...
+        storage.compA.real.ptr ...
 
     :param cls: The struct class with annotations.
     :return: The decorated struct class.
@@ -3806,14 +5575,16 @@ class struct:
         :ivar _size: The size of the MemRange.
         """
 
-        _dtype = None
-        _size = None
+        _dtype: Optional[Type[Numeric]] = None
+        _size: Optional[int] = None
 
-        def __new__(cls, name, bases, dct):
+        def __new__(
+            cls, name: str, bases: tuple[type, ...], dct: Dict[str, Any]
+        ) -> "struct._MemRangeMeta":
             new_cls = super().__new__(cls, name, bases, dct)
             return new_cls
 
-        def __getitem__(cls, params) -> Type["struct.MemRange"]:
+        def __getitem__(cls, params: tuple[Any, ...]) -> "Type[struct.MemRange]":
             # get params from syntax: struct.MemRange[dtype, size]
             if len(params) == 2:
                 dtype, size = params
@@ -3832,15 +5603,18 @@ class struct:
             return new_cls
 
         @property
-        def size(cls):
+        def size(cls) -> Optional[int]:
             return cls._size
 
         @property
-        def elem_width(cls):
-            return cls._dtype.width
+        def elem_width(cls) -> int:
+            dtype = cls._dtype
+            assert dtype is not None
+            return dtype.width if dtype is not Boolean else 8
 
         @property
-        def size_in_bytes(cls):
+        def size_in_bytes(cls) -> int:
+            assert cls.size is not None
             return cls.size * cls.elem_width // 8
 
     class MemRange(metaclass=_MemRangeMeta):
@@ -3859,7 +5633,12 @@ class struct:
         :param base: The base address of the memory range.
         """
 
-        def __init__(self, dtype, size, base):
+        def __init__(
+            self,
+            dtype: Optional[Type[Numeric]],
+            size: Optional[int],
+            base: Optional[Pointer],
+        ) -> None:
             """
             Initializes a new memory range.
 
@@ -3868,21 +5647,39 @@ class struct:
                          case the range can only be used for its address (e.g. as a partition marker).
             :param base: The base address of the memory range.
             """
-            self._dtype = dtype
-            self._size = size
-            self._base = base
+            self._dtype: Optional[Type[Numeric]] = dtype
+            self._size: Optional[int] = size
+            self._base: Optional[Pointer] = base
 
-        def data_ptr(self):
+        def __repr__(self) -> str:
+            return f"{object.__repr__(self)} <struct.MemRange[{self._dtype}, {self._size}]> <data_ptr = {self.data_ptr()}>"
+
+        @dsl_user_op
+        def data_ptr(
+            self,
+            *,
+            loc: Optional[ir.Location] = None,
+            ip: Optional[ir.InsertionPoint] = None,
+        ) -> Pointer:
             """
             Returns start pointer to the data in this memory range.
 
             :return: A pointer to the start of the memory range.
             :raises AssertionError: If the size of the memory range is negative.
             """
-            assert self._size >= 0
-            return recast_ptr(self._base, dtype=self._dtype)
+            assert self._size is not None and self._size >= 0
+            return recast_ptr(self._base, dtype=self._dtype, loc=loc, ip=ip)
 
-        def get_tensor(self, layout, swizzle=None, dtype=None):
+        @dsl_user_op
+        def get_tensor(
+            self,
+            layout: Union[Layout, ComposedLayout],
+            swizzle: Optional[Swizzle] = None,
+            dtype: Optional[Type[Numeric]] = None,
+            *,
+            loc: Optional[ir.Location] = None,
+            ip: Optional[ir.InsertionPoint] = None,
+        ) -> Tensor:
             """
             Creates a tensor from the memory range.
 
@@ -3895,16 +5692,23 @@ class struct:
             """
             from .tensor import make_tensor
 
-            assert self._size > 0
+            assert self._size is not None and self._size > 0
             # make tensor
             if isinstance(layout, ComposedLayout) and (swizzle is not None):
                 raise TypeError("incompatible layout with swizzle")
             elem_type = self._dtype if dtype is None else dtype
-            ptr = recast_ptr(self._base, swizzle, dtype=elem_type)
-            res = make_tensor(ptr, layout)
-            return res
+            ptr = recast_ptr(self._base, swizzle, dtype=elem_type, loc=loc, ip=ip)
+            res = make_tensor(ptr, layout, loc=loc, ip=ip)
+            return type(res)(res, dtype=elem_type, loc=loc, ip=ip)
 
-        def __getitem__(self, index: int) -> Any:
+        @dsl_user_op
+        def __getitem__(
+            self,
+            index: int,
+            *,
+            loc: Optional[ir.Location] = None,
+            ip: Optional[ir.InsertionPoint] = None,
+        ) -> Any:
             """
             Returns the element at the specified index in the memory range.
 
@@ -3912,8 +5716,34 @@ class struct:
             :return: The element at the specified index.
             :raises AssertionError: If the index is out of range.
             """
-            assert (index >= 0) and (index < self._size)
-            return self.data_ptr() + index
+            assert self._size is not None and (index >= 0) and (index < self._size)
+            ptr = self.data_ptr() + index
+            return ptr.load(loc=loc, ip=ip)
+
+        @dsl_user_op
+        def __setitem__(
+            self,
+            index: int,
+            val: Any,
+            *,
+            loc: Optional[ir.Location] = None,
+            ip: Optional[ir.InsertionPoint] = None,
+        ) -> None:
+            """
+            Set element value at the specified index in the memory range.
+
+            :param index: The index of the element to retrieve.
+            :val: The element value at the specified index.
+            :raises AssertionError: If the index is out of range.
+            """
+            assert self._size is not None and (index >= 0) and (index < self._size)
+            assert self._dtype is not None
+            ptr = self.data_ptr() + index
+            ptr.store(
+                as_numeric(val).to(self._dtype),
+                loc=loc,
+                ip=ip,
+            )
 
     # inner class for aligning a member type
     class _AlignMeta(type):
@@ -3928,13 +5758,15 @@ class struct:
         :ivar _align: The alignment of the data type.
         """
 
-        _dtype = None
-        _align = None
+        _dtype: Optional[Any] = None
+        _align: Optional[int] = None
 
-        def __new__(cls, name, bases, dct):
+        def __new__(
+            cls, name: str, bases: tuple[type, ...], dct: Dict[str, Any]
+        ) -> "struct._AlignMeta":
             return super().__new__(cls, name, bases, dct)
 
-        def __getitem__(cls, params) -> Any:
+        def __getitem__(cls, params: tuple[Any, ...]) -> Any:
             if len(params) == 2:
                 dtype, align = params
                 assert align > 0
@@ -3957,11 +5789,11 @@ class struct:
             return new_cls
 
         @property
-        def dtype(cls):
+        def dtype(cls) -> Optional[Any]:
             return cls._dtype
 
         @property
-        def align(cls):
+        def align(cls) -> Optional[int]:
             return cls._align
 
     class Align(metaclass=_AlignMeta):
@@ -3971,9 +5803,88 @@ class struct:
 
         pass
 
+    class _ScalarData(_Pointer):
+        """
+        Represents a scalar value at a given pointer location in memory.
+
+        This class provides utility methods to get a scalar pointer.
+        It wraps a pointer to a scalar element and enables element-wise memory operations.
+
+        :ivar _ptr: The underlying pointer to the scalar value.
+        """
+
+        def __init__(self, ptr: _Pointer) -> None:
+            self._ptr: _Pointer = ptr
+
+        def __repr__(self) -> str:
+            return f"{object.__repr__(self)} <{self.dtype}> <ptr = {self._ptr}>"
+
+        def __get_mlir_types__(self) -> List[ir.Type]:
+            return [self.value.type]
+
+        def __extract_mlir_values__(self) -> List[ir.Value]:
+            return [self.value]
+
+        def __new_from_mlir_values__(self, values: List[ir.Value]) -> Pointer:  # type: ignore[override]
+            ptr = _Pointer(
+                values[0] if isinstance(values[0], ir.Value) else values[0].value
+            )
+            return self.__class__(ptr)
+
+        @dsl_user_op
+        def to_llvm_ptr(
+            self,
+            *,
+            loc: Optional[ir.Location] = None,
+            ip: Optional[ir.InsertionPoint] = None,
+        ) -> ir.Value:
+            llvm_ptr_ty = llvm.PointerType.get(
+                self._ptr.memspace.value
+                if self._ptr.memspace != AddressSpace.rmem
+                else 0
+            )
+            return builtin.unrealized_conversion_cast(
+                [llvm_ptr_ty], [self.value], loc=loc, ip=ip
+            )
+
+        @property
+        def ptr(self) -> Pointer:
+            """
+            Get the underlying pointer.
+
+            :return: The pointer to the scalar value.
+            :rtype: Pointer
+            """
+            return self._ptr
+
+        @property
+        def dtype(self) -> Type[Numeric]:
+            """
+            Get the data type of the scalar value.
+
+            :return: The numeric data type of the underlying pointer.
+            :rtype: Type[Numeric]
+            """
+            return self._ptr.dtype
+
+        @property
+        @deprecated("Using `struct.scalar` as pointer is deprecated.")
+        def value(self) -> ir.Value:
+            """
+            Get the raw MLIR value of the underlying pointer.
+
+            .. deprecated::
+                Using ``struct.scalar`` as pointer is deprecated.
+                Use explicit ``struct.scalar.ptr`` for pointer instead.
+
+            :return: The MLIR value of the underlying pointer.
+            :rtype: ir.Value
+            """
+            return self._ptr.value
+
     # util func for base dsl scalar types
     @staticmethod
-    def _is_scalar_type(dtype):
+    def _is_scalar_type(dtype: Any) -> bool:
         """
         Checks if the given type is a scalar numeric type.
 
@@ -3982,8 +5893,26 @@ class struct:
         """
         return isinstance(dtype, type) and issubclass(dtype, Numeric)
 
+    @staticmethod
+    def _install_dynamic_expression_protocol(cls: type, decorator: Any) -> None:
+        type.__setattr__(
+            cls,
+            "__get_mlir_types__",
+            lambda self: self.base.__get_mlir_types__(),
+        )
+        type.__setattr__(
+            cls,
+            "__extract_mlir_values__",
+            lambda self: self.base.__extract_mlir_values__(),
+        )
+        type.__setattr__(
+            cls,
+            "__new_from_mlir_values__",
+            lambda self, values: decorator(self.base.__new_from_mlir_values__(values)),
+        )
+
     # calculate size and alignment
-    def __init__(self, cls):
+    def __init__(self, cls: type) -> None:
         """
         Initializes a new struct decorator instance.
 
@@ -3991,55 +5920,76 @@ class struct:
         :raises TypeError: If the struct is empty.
         """
         self._cls = cls
-        self.__name__ = f"struct::{cls.__name__}"
+        self.__name__ = f"cute.struct::{cls.__name__}"
         # Get the class annotations
         self._annotations = getattr(cls, "__annotations__", {})
         # Create a dictionary to store the offsets
         self._offsets: Dict[str, int] = {}
+
+        # Override `setattr` function for struct to assign scalar properly
+        def struct_setattr(self: Any, name: str, value: Any) -> None:
+            attr = getattr(self, name, None)
+            if isinstance(attr, struct._ScalarData):
+                value = as_numeric(value).to(attr.dtype)
+                attr.ptr.store(value)  # type: ignore[attr-defined]
+            else:
+                raise ValueError(f"cannot assign value to `{name}` in {self.__name__}")
+
+        type.__setattr__(self._cls, "__setattr__", struct_setattr)
+
+        # Override `__repr__` function for struct info
+        def struct_repr(self: Any) -> str:
+            return f"{object.__repr__(self)} <{self.__name__}> <base = {self.base}>"
+
+        type.__setattr__(self._cls, "__repr__", struct_repr)
+
+        # A struct instance is fully described by its base pointer; fields are
+        # re-derived from static offsets when the struct is reconstructed.
+        struct._install_dynamic_expression_protocol(self._cls, self)
 
         # Calculate the offsets and alignment
         offset = 0
         alignment = 1
         if len(self._annotations) == 0:
             raise TypeError("Empty struct is not supported!")
-        for name, object in self._annotations.items():
-            # get alignment of object
+        for name, member in self._annotations.items():
+            # get alignment of member
             sub_align = 1
-            if isinstance(object, struct._AlignMeta):
-                sub_align = object.align
-                object = object.dtype
+            if isinstance(member, struct._AlignMeta):
+                sub_align = member.align  # type: ignore[assignment]
+                member = member.dtype
 
             # switch addition order to support dynamic size
-            def add_offset(val):
+            def add_offset(val: Any) -> Any:
                 return val + offset if isinstance(val, ir.Value) else offset + val
 
             # size of scalar
-            if struct._is_scalar_type(object):
-                dtype_size = max(1, object.width // 8)
+            if struct._is_scalar_type(member):
+                dtype_size = max(1, member.width // 8)
                 sub_align = max(dtype_size, sub_align)
                 offset = self.align_offset(offset, sub_align)
                 self._offsets[name] = offset
                 offset = add_offset(dtype_size)
             # size of array is size_in_bytes, alignment is elem_size
-            elif isinstance(object, struct._MemRangeMeta):
+            elif isinstance(member, struct._MemRangeMeta):
                 # Allow empty array as a free marker-only struct member.
                 # Use max(sub_align, ) because we might have in the future some
-                # object.elem_width less than 8, such as fp4, bit and others,
+                # member.elem_width less than 8, such as fp4, bit and others,
                 # and align_offset() does not support an alignment of 0.
-                sub_align = max(object.elem_width // 8, sub_align)
+                sub_align = max(member.elem_width // 8, sub_align)
                 offset = self.align_offset(offset, sub_align)
                 self._offsets[name] = offset
-                offset = add_offset(object.size_in_bytes)
+                offset = add_offset(member.size_in_bytes)
             # size of struct
-            elif isinstance(object, struct):
-                sub_align = max(object.__alignof__(), sub_align)
+            elif isinstance(member, struct):
+                sub_align = max(member.__alignof__(), sub_align)
                 offset = self.align_offset(offset, sub_align)
                 self._offsets[name] = offset
-                offset = add_offset(object.__sizeof__())
+                offset = add_offset(member.__sizeof__())
             else:
                 raise TypeError(
                     f"Struct element only support struct/array/base_dsl scalar, "
-                    f"but got {object}"
+                    f"but got {member}"
                 )
             # Total alignment determined by the strictest requirement
             alignment = max(alignment, sub_align)
@@ -4048,7 +5998,14 @@ class struct:
         self._size_of = self.align_offset(offset, alignment)
 
     # create the __init__ method for decorated struct
-    def __call__(self, base: Any) -> None:
+    @dsl_user_op
+    def __call__(
+        self,
+        base: Any,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Any:
         """
         Creates a new instance of the decorated struct.
 
@@ -4061,20 +6018,22 @@ class struct:
         # make an new object of user-defined decorated struct
         # otherwise it will override same self._cls when new instance created
         cls = self._cls()
-        setattr(cls, "_base", base)
+        object.__setattr__(cls, "base", base)
+        object.__setattr__(cls, "__name__", self.__name__)
         for name, off in self._offsets.items():
             obj = self._annotations[name]
             if isinstance(obj, struct._AlignMeta):
                 obj = obj.dtype
             if struct._is_scalar_type(obj):
-                new_obj = recast_ptr(base + off, dtype=obj)
-                setattr(cls, name, new_obj)
+                ptr = recast_ptr(base + off, dtype=obj, loc=loc, ip=ip)
+                new_obj: Any = struct._ScalarData(ptr)
+                object.__setattr__(cls, name, new_obj)
             elif isinstance(obj, struct._MemRangeMeta):
                 new_obj = struct._MemRangeData(obj._dtype, obj._size, base + off)
-                setattr(cls, name, new_obj)
+                object.__setattr__(cls, name, new_obj)
             elif isinstance(obj, struct):
                 new_obj = obj(base + off)
-                setattr(cls, name, new_obj)
+                object.__setattr__(cls, name, new_obj)
             else:
                 raise TypeError(
                     f"Struct element only support struct/array/base_dsl scalar, "
@@ -4101,27 +6060,588 @@ class struct:
 
     # util func for aligning offset
     @staticmethod
-    def align_offset(offset, align):
+    def align_offset(offset: Any, align: int) -> Any:
         """
         Return the round-up offset up to the next multiple of align.
         """
-        assert align > 0 and not (
-            align & (align - 1)
-        ), "align should be a strictly positive power of 2."
+        assert align > 0 and not (align & (align - 1)), (
+            "align should be a strictly positive power of 2."
+        )
         return (offset + (align - 1)) & ~(align - 1)
 
 
-# Deprecated usage but keep them to avoid breaking some examples uses `cute.core.ThrMma`
-
-from .atom import ThrCopy as _ThrCopy
-from .atom import ThrMma as _ThrMma
-
-
-@deprecated("cute.core.ThrMma is deprecated, use cute.ThrMma instead")
-class ThrMma(_ThrMma):
-    pass
+##############################################################################
+# User defined struct
+##############################################################################
 
 
-@deprecated("cute.core.ThrCopy is deprecated, use cute.ThrCopy instead")
-class ThrCopy(_ThrCopy):
-    pass
+class union(struct):
+    """
+    Decorator to abstract C union in Python DSL.
+
+    Similar to cute.struct, but lays out objects as a union:
+    - All objects start at offset 0
+    - The alignment is the maximum alignment of all objects
+    - The size is the maximum size of all objects
+
+    **Usage:**
+
+    .. code-block:: python
+
+        # Define a union with scalar int/float elements:
+        @cute.union
+        class value_union:
+            as_int : cutlass.Int32
+            as_float : cutlass.Float32
+
+
+        @cute.union
+        class data_union:
+            small : cutlass.Int16
+            medium : cutlass.Int32
+            large : cutlass.Int64
+
+
+        # Supports alignment for its elements:
+        @cute.union
+        class aligned_union:
+            a: cute.struct.Align[cutlass.Float32, 16]
+            b: cute.struct.Align[cutlass.Int32, 8]
+
+
+        # Statically get size and alignment:
+        size = data_union.__sizeof__()
+        align = data_union.__alignof__()
+
+        # Allocate and reference elements:
+        allocator = cutlass.utils.SmemAllocator()
+        value = allocator.allocate(data_union)
+
+        # Access union members (all at the same offset):
+        value.small.ptr ...
+        value.medium.ptr ...
+        value.large.ptr ...
+
+    :param cls: The union class with annotations.
+    :return: The decorated union class.
+    """
+
+    def __init__(self, cls: type) -> None:
+        """
+        Initializes a new cute.union decorator instance.
+
+        :param cls: The class representing the union data type.
+        :raises TypeError: If the union is empty.
+        """
+        object.__setattr__(self, "_cls", cls)
+        object.__setattr__(self, "__name__", f"cute.union::{cls.__name__}")
+        # Get the class annotations
+        object.__setattr__(self, "_annotations", getattr(cls, "__annotations__", {}))
+        # Create a dictionary to store the offsets (all zeros for union)
+        object.__setattr__(self, "_offsets", {})
+
+        # Override `setattr` function for struct to assign scalar properly
+        def union_setattr(self: Any, name: str, value: Any) -> None:
+            attr = getattr(self, name, None)
+            if isinstance(attr, struct._ScalarData):
+                value = as_numeric(value).to(attr.dtype)
+                attr.ptr.store(value)  # type: ignore[attr-defined]
+            else:
+                raise ValueError(f"cannot assign value to `{name}` in {self.__name__}")
+
+        type.__setattr__(self._cls, "__setattr__", union_setattr)
+
+        # Override `__repr__` function for struct info
+        def union_repr(self: Any) -> str:
+            return f"{object.__repr__(self)} <{self.__name__}> <base = {self.base}>"
+
+        type.__setattr__(self._cls, "__repr__", union_repr)
+
+        # A union instance is fully described by its base pointer; fields are
+        # re-derived from offset zero when the union is reconstructed.
+        struct._install_dynamic_expression_protocol(self._cls, self)
+
+        # Calculate the maximum size and alignment
+        max_size = 0
+        max_alignment = 1
+        if len(self._annotations) == 0:
+            raise TypeError("Empty union is not supported!")
+        for name, item in self._annotations.items():
+            # All offsets are 0 for a union
+            self._offsets[name] = 0
+
+            # Get alignment of object
+            sub_align = 1
+            if isinstance(item, struct._AlignMeta):
+                sub_align = item.align  # type: ignore[assignment]
+                item = item.dtype
+
+            # Calculate size and alignment based on object type
+            if struct._is_scalar_type(item):
+                dtype_size = max(1, item.width // 8)
+                sub_align = max(dtype_size, sub_align)
+                max_size = max(max_size, dtype_size)
+            elif isinstance(item, struct._MemRangeMeta):
+                sub_align = max(item.elem_width // 8, sub_align)
+                max_size = max(max_size, item.size_in_bytes)
+            elif isinstance(item, struct):
+                sub_align = max(item.__alignof__(), sub_align)
+                max_size = max(max_size, item.__sizeof__())
+            else:
+                raise TypeError(
+                    f"Union element only support struct/array/DSL scalar, "
+                    f"but got `{item.__qualname__}`"
+                )
+            # Union alignment is the maximum alignment of all members
+            max_alignment = max(max_alignment, sub_align)
+
+        # Union size is the maximum size, aligned to the maximum alignment
+        object.__setattr__(self, "_align_of", max_alignment)
+        object.__setattr__(
+            self, "_size_of", struct.align_offset(max_size, max_alignment)
+        )
+
+    @dsl_user_op
+    def __call__(
+        self,
+        base: Any,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Any:
+        """
+        Creates a new instance of the decorated union.
+
+        :param base: The base address of the union.
+        :return: An instance of the decorated union.
+        :raises TypeError: If the base pointer is not byte-sized.
+        """
+        if base.type.value_type.width != 8:
+            raise TypeError("union base ptr value type must be byte sized.")
+        # Make a new object of user-defined decorated union
+        cls = self._cls()
+        object.__setattr__(cls, "base", base)
+        object.__setattr__(cls, "__name__", self.__name__)
+        for name, off in self._offsets.items():
+            obj = self._annotations[name]
+            if isinstance(obj, struct._AlignMeta):
+                obj = obj.dtype
+            if struct._is_scalar_type(obj):
+                ptr = recast_ptr(base + off, dtype=obj, loc=loc, ip=ip)
+                new_obj: Any = struct._ScalarData(ptr)
+                object.__setattr__(cls, name, new_obj)
+            elif isinstance(obj, struct._MemRangeMeta):
+                new_obj = struct._MemRangeData(obj._dtype, obj._size, base + off)
+                object.__setattr__(cls, name, new_obj)
+            elif isinstance(obj, struct):
+                new_obj = obj(base + off)
+                object.__setattr__(cls, name, new_obj)
+            else:
+                raise TypeError(
+                    f"Union element only support struct/array/DSL scalar, "
+                    f"but got `{obj.__qualname__}`"
+                )
+        return cls
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise TypeError("Cannot add a new field after initialization")
+    def size_in_bytes(self) -> int:
+        """
+        Returns the size of the union in bytes.
+
+        :return: The size of the union.
+        """
+        return self._size_of
+
+    def __sizeof__(self) -> int:
+        """
+        Returns the size of the union in bytes.
+
+        :return: The size of the union.
+        """
+        return self._size_of
+
+    def __alignof__(self) -> int:
+        """
+        Returns the alignment of the union in bytes.
+
+        :return: The alignment of the union.
+        """
+        return self._align_of
+
+
+#
+# FastDivmod operations for optimized division and modulus
+#
+class FastDivmodDivisor:
+    """
+    First-class FastDivmod divisor with operator overloading support.
+
+    This class wraps a FastDivmod divisor and enables natural Python operator syntax.
+
+    .. deprecated::
+        Use :class:`FastDivmodDivisorV2` instead. V2 additionally carries the
+        scalar divisor across kernel boundaries (2 MLIR values per object
+        instead of 1), so ``.divisor`` is readable inside kernels;
+        arithmetic is unchanged. This class keeps the legacy 1-value
+        serialization contract for existing integrations.
+
+    :ivar divisor: The original divisor value (publicly accessible)
+    :ivar _divisor_mlir: The FastDivmod divisor MLIR value (internal)
+
+    **Example:**
+
+    .. code-block:: python
+
+        quotient, remainder = divmod(dividend, divisor)
+        quotient = dividend // divisor
+        remainder = dividend % divisor
+    """
+
+    @dsl_user_op
+    def __init__(
+        self,
+        divisor: Integer,
+        is_power_of_2: Optional[bool] = None,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> None:
+        """
+        Create a FastDivmod divisor for optimized division operations.
+
+        :param divisor: The divisor value (should be runtime-dynamic value)
+        :param is_power_of_2: Whether divisor is known to be a power of 2.
+                              Defaults to False.
+        """
+        # Subclasses (FastDivmodDivisorV2) share this __init__; only direct
+        # use of the legacy class is deprecated.
+        if type(self) is FastDivmodDivisor:
+            warnings.warn(
+                "FastDivmodDivisor is deprecated in favor of "
+                "cute.FastDivmodDivisorV2 / cute.fast_divmod_create_divisor_v2. "
+                "V2 additionally carries the scalar divisor across kernel "
+                "boundaries (2 MLIR values per object instead of 1), so "
+                "'.divisor' is readable inside kernels; "
+                "arithmetic (divmod, //, %) is unchanged.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        # Store the original divisor value for public access
+        self._original_divisor = divisor
+
+        # Convert divisor to ir.Value for MLIR operation
+        if isinstance(divisor, ir.Value):
+            divisor_val = divisor
+        else:
+            divisor_val = Int32(divisor).ir_value()
+
+        # Use user-provided flag or default to False
+        # Power-of-2 optimization should be handled by compiler passes at IR level
+        if is_power_of_2 is None:
+            is_power_of_2 = False
+
+        # Create FastDivmod divisor
+        fast_divmod_divisor_type = _cute_ir.FastDivmodDivisorType.get(32, is_power_of_2)
+        self._divisor_mlir = _cute_ir.fast_divmod_create_divisor(
+            fast_divmod_divisor_type, divisor_val, loc=loc, ip=ip
+        )
+
+    @dsl_user_op
+    def __rdivmod__(
+        self,
+        dividend: Integer,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Tuple[Integer, Integer]:
+        """
+        Overload for: divmod(dividend, self)
+        Returns (quotient, remainder).
+
+        :param dividend: The dividend value
+        :param loc: Source location for MLIR
+        :param ip: Insertion point for MLIR
+        :return: Tuple of (quotient, remainder)
+        """
+        # Convert dividend to ir.Value for MLIR operation
+        if isinstance(dividend, ir.Value):
+            dividend_val = dividend
+        else:
+            dividend_val = Int32(dividend).ir_value()
+
+        quotient_type = dividend_val.type
+        remainder_type = dividend_val.type
+
+        results = _cute_ir.fast_divmod_compute(
+            quotient_type,
+            remainder_type,
+            dividend_val,
+            self._divisor_mlir,
+            loc=loc,
+            ip=ip,
+        )
+        return (IntValue(results[0]), IntValue(results[1]))
+
+    @dsl_user_op
+    def __rfloordiv__(
+        self,
+        dividend: Integer,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Integer:
+        """
+        Overload for: dividend // self
+        Returns quotient only.
+
+        :param dividend: The dividend value
+        :param loc: Source location for MLIR
+        :param ip: Insertion point for MLIR
+        :return: The quotient
+        """
+        quotient, _ = self.__rdivmod__(dividend, loc=loc, ip=ip)
+        return quotient
+
+    @dsl_user_op
+    def __rmod__(
+        self,
+        dividend: Integer,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Integer:
+        """
+        Overload for: dividend % self
+        Returns remainder only.
+
+        :param dividend: The dividend value
+        :param loc: Source location for MLIR
+        :param ip: Insertion point for MLIR
+        :return: The remainder
+        """
+        _, remainder = self.__rdivmod__(dividend, loc=loc, ip=ip)
+        return remainder
+
+    @property
+    def divisor(self) -> Integer:
+        """
+        Get the original divisor value.
+
+        This allows users to access the divisor value that was used to create
+        this FastDivmodDivisor object. This is useful for passing the divisor
+        value to other functions or for storing it in data structures without
+        needing to manually track the divisor value separately.
+
+        :return: The original divisor value
+        :rtype: Integer
+
+        **Example:**
+
+        .. code-block:: python
+
+            batch_size = 32
+            batch_fdd = cute.fast_divmod_create_divisor(batch_size)
+            print(f"Divisor: {batch_fdd.divisor}")  # Access the divisor value
+            some_function(divisor=batch_fdd.divisor)  # Pass to other functions
+
+        .. note::
+            After this object crosses a kernel boundary (e.g. stored in a
+            params structure passed to a ``@cute.kernel``), the returned value
+            still references host-side SSA and fails MLIR region isolation if
+            used inside the kernel (OSS issue #3243). Use
+            :class:`FastDivmodDivisorV2` to read the divisor inside a kernel.
+        """
+        return self._original_divisor
+
+    @divisor.setter
+    def divisor(self, value: Integer) -> None:
+        self._original_divisor = value
+
+    # Backward compatibility: _divisor was renamed to _divisor_mlir in 4.5
+    @property
+    def _divisor(self) -> ir.Value:
+        return self._divisor_mlir
+
+    @_divisor.setter
+    def _divisor(self, value: ir.Value) -> None:
+        self._divisor_mlir = value
+
+    def __extract_mlir_values__(self) -> List[ir.Value]:
+        """Extract MLIR values for Host->Device transfer."""
+        # CRITICAL: Extract the FastDivmodDivisor MLIR value directly.
+        #
+        # This allows GridInvariantCodeMotionPass to:
+        # 1. Recognize FastDivmodCreateDivisorOp in the IR
+        # 2. Hoist it to the host side before kernel launch
+        # 3. Pass the pre-computed divisor as a kernel argument
+        #
+        # We only extract the _divisor_mlir to maintain compatibility with
+        # other code that assumes each FastDivmodDivisor has exactly 1 MLIR value.
+        # The _original_divisor is preserved in the object structure.
+        return [self._divisor_mlir]
+
+    def __new_from_mlir_values__(self, values: List[ir.Value]) -> "FastDivmodDivisor":
+        """Reconstruct FastDivmodDivisor from MLIR values."""
+        # Directly use the passed FastDivmodDivisor value without recreating it.
+        # This is critical to avoid generating new create_divisor ops on device side,
+        # which would bypass GridInvariantCodeMotionPass optimization.
+        new_obj = object.__new__(FastDivmodDivisor)
+        new_obj._divisor_mlir = values[0]
+
+        # Preserve the original divisor to support the public divisor property.
+        # Note: After host-device transfer, _original_divisor will reference
+        # the same value as before transfer for constants, or the reconstructed
+        # value for dynamic expressions.
+        new_obj._original_divisor = self._original_divisor
+
+        return new_obj
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(divisor={self._original_divisor}, type={self._divisor_mlir.type})"
+
+
+# Set explicit signature for Sphinx documentation to avoid issues with @dsl_user_op decorator
+FastDivmodDivisor.__init__.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+    [
+        inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        inspect.Parameter(
+            "divisor", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Integer
+        ),
+        inspect.Parameter(
+            "is_power_of_2",
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            default=None,
+            annotation=bool,
+        ),
+    ]
+)
+
+
+@dsl_user_op
+def fast_divmod_create_divisor(
+    divisor: Integer,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> FastDivmodDivisor:
+    """Create a FastDivmod divisor for optimized division operations.
+
+    This function creates a FastDivmod divisor that precomputes auxiliary values
+    to enable fast division and modulus operations without using division instructions.
+
+    The returned FastDivmodDivisor object supports natural Python operator syntax.
+
+    :param divisor: The divisor value (should be runtime-dynamic value)
+    :type divisor: Integer
+    :return: FastDivmodDivisor object with operator overloading support
+    :rtype: FastDivmodDivisor
+
+    **Example:**
+
+    .. code-block:: python
+
+        divisor = fast_divmod_create_divisor(batch_size)
+        quotient, remainder = divmod(linear_idx, divisor)
+        quotient = linear_idx // divisor
+        remainder = linear_idx % divisor
+    """
+    return FastDivmodDivisor(divisor, loc=loc, ip=ip)
+
+
+class FastDivmodDivisorV2(FastDivmodDivisor):
+    """
+    FastDivmod divisor whose ``.divisor`` property is readable inside kernels.
+
+    Same arithmetic behavior as :class:`FastDivmodDivisor` (``divmod``, ``//``,
+    ``%``), but serializes **two** MLIR values across region boundaries — the
+    encoded FastDivmod plus the scalar divisor — so ``.divisor`` resolves to
+    in-region SSA after the object crosses a kernel boundary (OSS issue #3243):
+
+    .. code-block:: python
+
+        @dataclass
+        class Params:
+            fdd: cute.FastDivmodDivisorV2
+
+        @cute.kernel
+        def kernel(out: cute.Tensor, params: Params):
+            out[0] = params.fdd.divisor  # OK: region-local SSA
+
+    :class:`FastDivmodDivisor` keeps the legacy 1-value serialization contract
+    for backward compatibility; its ``.divisor`` is not readable inside a
+    kernel.
+    """
+
+    def __extract_mlir_values__(self) -> List[ir.Value]:
+        """Extract MLIR values for Host->Device transfer.
+
+        Two SSA values are emitted: the encoded FastDivmod (``_divisor_mlir``)
+        and the scalar divisor that was used to build it. The encoded value
+        still flows through GridInvariantCodeMotionPass for host hoisting; the
+        scalar value is needed so ``.divisor`` resolves to in-region SSA after
+        crossing the kernel boundary (issue #3243).
+        """
+        divisor_for_pack = self._original_divisor
+        if isinstance(divisor_for_pack, ir.Value):
+            divisor_ir = divisor_for_pack
+        else:
+            divisor_ir = Int32(divisor_for_pack).ir_value()
+        return [self._divisor_mlir, divisor_ir]
+
+    def __new_from_mlir_values__(self, values: List[ir.Value]) -> "FastDivmodDivisorV2":
+        """Reconstruct FastDivmodDivisorV2 from MLIR values.
+
+        Rebuilds ``_original_divisor`` from the SSA passed in ``values[1]`` so
+        that ``.divisor`` reads kernel-region SSA, not the host-side template.
+        """
+        if len(values) != 2:
+            raise ValueError(
+                "FastDivmodDivisorV2 expects exactly 2 MLIR values (encoded "
+                f"divisor + scalar divisor SSA), got {len(values)}. If this "
+                "object is held by a params class with a hand-written "
+                "__new_from_mlir_values__, make sure it slices 2 values per "
+                "FastDivmodDivisorV2 field."
+            )
+        new_obj = object.__new__(FastDivmodDivisorV2)
+        new_obj._divisor_mlir = values[0]
+        # values[1] may arrive as a raw ir.Value or as a typed integer wrapper
+        # (the framework value caster reconstructs typed wrappers across the
+        # kernel boundary). Normalize to IntValue so '.divisor' supports
+        # arithmetic and repr inside the kernel.
+        scalar_divisor = values[1]
+        if isinstance(scalar_divisor, ir.Value):
+            scalar_divisor = IntValue(scalar_divisor)
+        new_obj._original_divisor = scalar_divisor
+        return new_obj
+
+
+@dsl_user_op
+def fast_divmod_create_divisor_v2(
+    divisor: Integer,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> FastDivmodDivisorV2:
+    """Create a FastDivmod divisor whose ``.divisor`` is readable inside kernels.
+
+    Behaves like :func:`fast_divmod_create_divisor`, but the returned
+    :class:`FastDivmodDivisorV2` serializes both the encoded FastDivmod and the
+    scalar divisor across kernel boundaries, so ``.divisor`` resolves to
+    region-local SSA inside a kernel (OSS issue #3243).
+
+    :param divisor: The divisor value (should be runtime-dynamic value)
+    :type divisor: Integer
+    :return: FastDivmodDivisorV2 object with operator overloading support
+    :rtype: FastDivmodDivisorV2
+
+    **Example:**
+
+    .. code-block:: python
+
+        divisor = fast_divmod_create_divisor_v2(batch_size)
+        quotient, remainder = divmod(linear_idx, divisor)
+        d = divisor.divisor  # readable on host AND inside kernels
+    """
+    return FastDivmodDivisorV2(divisor, loc=loc, ip=ip)

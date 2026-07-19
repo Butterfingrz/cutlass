@@ -1,12 +1,13 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# Use of this software is governed by the terms and conditions of the
+# NVIDIA End User License Agreement (EULA), available at:
+# https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/license.html
+#
+# Any use, reproduction, disclosure, or distribution of this software
+# and related documentation outside the scope permitted by the EULA
+# is strictly prohibited.
 
 """
 CuTeDSL Development Package Setup
@@ -23,7 +24,7 @@ import tempfile
 import zipfile
 import re
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Tuple
 import logging
 
 # Configure logging
@@ -171,7 +172,7 @@ def copy_library_files(extract_dir: Path, package_root: Path) -> int:
     Returns:
         Number of files copied
     """
-    lib_pattern = extract_dir / "**" / "lib" / "*.so"
+    extract_dir / "**" / "lib" / "*.so"
     so_files = [f for f in extract_dir.rglob("lib/*.so")]
 
     if not so_files:
@@ -218,7 +219,7 @@ def copy_python_packages(extract_dir: Path, package_root: Path) -> Tuple[int, in
     cutlass_source_dir = cutlass_source_dirs[0]
     cutlass_dest_dir = package_root / "cutlass"
 
-    logger.info(f"Found python_packages/cutlass/ directory")
+    logger.info("Found python_packages/cutlass/ directory")
     logger.info(f"Copying from {cutlass_source_dir} to {cutlass_dest_dir}")
 
     copied_count = 0

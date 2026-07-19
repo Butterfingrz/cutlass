@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -1042,7 +1042,8 @@ sm100_dense_compute_tile_shape_or_override() {
     constexpr int N_min_D = (detail::is_m_major<GmemStrideTypeD>()) ? 8 * WarpN
                               : (sizeof_bits_v<ElementD> == 6) ? 128 * WarpN // TMA store only supports SW128B for FP6 data type
                                                               : 128 / sizeof_bits_v<ElementD> * WarpN;
-    constexpr int N = cute::min(CtaN, cute::max(N_perf, N_min_C, N_min_D));
+    constexpr int N_tmp = cute::min(CtaN, cute::max(N_perf, N_min_C, N_min_D));
+    constexpr int N = CtaN % N_tmp == 0 ? N_tmp : CtaN;
     static_assert(CtaN >= N_min_C && CtaN >= N_min_D, "CTA tile too small");
 
     // stride by tmem warp layout and return a by-mode tiler
@@ -1120,6 +1121,23 @@ sm100_dense_dispatch_policy() {
   else if constexpr (is_base_of_v<NoSmemWarpSpecialized1Sm, EpilogueScheduleType> || is_base_of_v<NoSmemWarpSpecialized2Sm, EpilogueScheduleType>) {
     return Sm100NoSmemWarpSpecialized{};
   }
+  else if constexpr (is_same_v<EpilogueScheduleType, PtrArrayPlanarComplexNoSmemWarpSpecialized1Sm> ||
+                     is_same_v<EpilogueScheduleType, PtrArrayPlanarComplexNoSmemWarpSpecialized2Sm>) {
+    return Sm100PtrArrayPlanarComplexNoSmemWarpSpecialized{};
+  }
+  else if constexpr (is_same_v<EpilogueScheduleType, PtrArrayPlanarComplexTmaWarpSpecialized1Sm> ||
+                     is_same_v<EpilogueScheduleType, PtrArrayPlanarComplexTmaWarpSpecialized2Sm>) {
+    constexpr bool ReuseSmem_ = (sizeof_bits_v<ElementC_> == sizeof_bits_v<ElementD>); // limited smem reuse support for planar complex for now
+    constexpr int StagesC_ = ReuseSmem_ ? cute::max(cute::min(EpiTiles, 4), StagesD+1) : cute::min(EpiTiles, 4);
+    constexpr bool DelayTmaStore_ = false; // TMA store delay complicates tensormap updates for Ptr-Array GEMMs
+    return Sm100PtrArrayPlanarComplexTmaWarpSpecialized<StagesC_, StagesD, FragmentSize, ReuseSmem_, DelayTmaStore_>{};
+  }
+  else if constexpr (is_same_v<EpilogueScheduleType, PlanarComplexTmaWarpSpecialized1Sm> ||
+                     is_same_v<EpilogueScheduleType, PlanarComplexTmaWarpSpecialized2Sm>) {
+    constexpr bool ReuseSmem_ = (sizeof_bits_v<ElementC_> == sizeof_bits_v<ElementD>); // limited smem reuse support for planar complex for now
+    constexpr int StagesC_ = ReuseSmem_ ? cute::max(cute::min(EpiTiles, 4), StagesD+1) : cute::min(EpiTiles, 4);
+    return Sm100PlanarComplexTmaWarpSpecialized<StagesC_, StagesD, FragmentSize, ReuseSmem_, DelayTmaStore>{};
+  }
   else if constexpr (is_same_v<EpilogueScheduleType, PtrArrayTmaWarpSpecialized1Sm> ||
                      is_same_v<EpilogueScheduleType, PtrArrayTmaWarpSpecialized2Sm>) {
     constexpr bool DelayTmaStore_ = false; // TMA store delay complicates tensormap updates for Ptr-Array GEMMs
@@ -1191,6 +1209,27 @@ private:
   using CtaTileShape_MNK = decltype(cta_tile_shape());
   using TmemWarpShape_MN = decltype(detail::sm100_tmem_warps<Is2SmMma, MmaTileShape_MNK>());
 
+  // SM100 2SM TMA epilogue with 16-bit elements and EpilogueTileAuto requires CtaN divisible
+  // by 64 when CtaN > 128. When MaxBits==16 and CtaN>128, N_perf=64 is selected, but if
+  // CtaN%64!=0 the epilogue tile falls back to CtaN, producing non-64-aligned strides in
+  // the SMEM swizzle layout that break upcast<64>.
+  static constexpr int EpiSmemMaxBits_ =
+      (sizeof_bits_v<InternalSmemElementC> >= sizeof_bits_v<InternalSmemElementD>)
+          ? sizeof_bits_v<InternalSmemElementC>
+          : sizeof_bits_v<InternalSmemElementD>;
+  static_assert(
+      !Is2SmMma ||
+      !cute::is_same_v<EpilogueTileType, EpilogueTileAuto> ||
+      FusionOp::IsPerColScaleSupported ||
+      EpiSmemMaxBits_ != 16 ||
+      size<1>(CtaTileShape_MNK{}) <= 128 ||
+      size<1>(CtaTileShape_MNK{}) % 64 == 0,
+      "SM100 2SM TMA epilogue: 16-bit element types (f16/bf16) with CtaN > 128 require "
+      "CtaN to be divisible by 64. CtaN=160 and CtaN=224 are unsupported. "
+      "Use a CtaN that is a multiple of 64 (e.g. 128, 192, 256) "
+      "or use a 32-bit output type (f32)."
+  );
+
   // Attempts to compute a reasonably performant epilogue tile or allows the user to provide one.
   static constexpr auto
   epilogue_tile() {
@@ -1234,6 +1273,16 @@ private:
 
   static constexpr auto
   fusion_callbacks() {
+    if constexpr (is_same_v<Schedule, PtrArrayPlanarComplexTmaWarpSpecialized1Sm> ||
+                  is_same_v<Schedule, PtrArrayPlanarComplexTmaWarpSpecialized2Sm> ||
+                  is_same_v<Schedule, PlanarComplexTmaWarpSpecialized1Sm> ||
+                  is_same_v<Schedule, PlanarComplexTmaWarpSpecialized2Sm>) {
+      static_assert(IsDefaultFusionOp<FusionOp>::value, "unsupported schedule + fusion");
+      constexpr thread::ScaleType::Kind ScaleType = DisableSource ? thread::ScaleType::OnlyAlphaScaling : thread::ScaleType::Default;
+      return thread::LinearCombinationPlanarComplex<
+              ElementD, FragmentSize, ElementAccumulator, ElementCompute, FusionOp::RoundStyle, ScaleType>({});
+    }
+    else
     {
       return typename CallbacksBuilder<
                         decltype(dispatch_policy()),
@@ -1513,6 +1562,12 @@ private:
       return thread::LinearCombination<
                 ElementD, 1, ElementAccumulator, ElementCompute, ScaleType, FusionOp::RoundStyle, ElementC>({});
     }
+    else if constexpr (is_same_v<EpilogueScheduleType, PtrArrayPlanarComplexNoSmemWarpSpecialized1Sm> ||
+                       is_same_v<EpilogueScheduleType, PtrArrayPlanarComplexNoSmemWarpSpecialized2Sm>) {
+      static_assert(IsDefaultFusionOp<FusionOp>::value, "unsupported schedule + fusion");
+      return thread::LinearCombinationPlanarComplex<
+                ElementD, FragmentSize, ElementAccumulator, ElementCompute, FusionOp::RoundStyle, ScaleType>({});
+    }
     else {
       return typename detail::CallbacksBuilder<
                 DispatchPolicy,
@@ -1779,6 +1834,7 @@ struct CollectiveBuilder<
       CopyAtomR2G,
       Schedule>;
 };
+
 ///////////////////////////////////////////////////////////////////////////////
 
 } // namespace cutlass::epilogue::collective

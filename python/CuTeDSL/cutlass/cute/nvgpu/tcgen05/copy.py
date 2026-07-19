@@ -1,9 +1,9 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Use of this software is governed by the terms and conditions of the
 # NVIDIA End User License Agreement (EULA), available at:
-# https://docs.nvidia.com/cutlass/media/docs/pythonDSL/license.html
+# https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/license.html
 #
 # Any use, reproduction, disclosure, or distribution of this software
 # and related documentation outside the scope permitted by the EULA
@@ -11,20 +11,36 @@
 
 import enum
 from dataclasses import dataclass
-from typing import Type
+from typing import Any, Optional, Type
 
-from cutlass import cute
 from cutlass.base_dsl.arch import Arch
-from cutlass.cutlass_dsl import CuTeDSL
+from cutlass.cutlass_dsl import BaseDSL
 
 import cutlass._mlir.dialects.cute_nvgpu as _cute_nvgpu_ir
 from cutlass._mlir import ir
 
 from ..common import OpError
-from ...atom import CopyOp, Trait
+from ...atom import CopyOp, Trait, make_atom
 from ...typing import Numeric
 
 from .mma import CtaGroup
+
+
+class TmemLoadRedOp(enum.Enum):
+    """
+    An enumeration for the possible reduce operations for TMEM load operations.
+    """
+
+    MAX = _cute_nvgpu_ir.TmemLoadRedOp.max
+    MAXABS = _cute_nvgpu_ir.TmemLoadRedOp.maxabs
+    MIN = _cute_nvgpu_ir.TmemLoadRedOp.min
+    MINABS = _cute_nvgpu_ir.TmemLoadRedOp.minabs
+
+    def __str__(self) -> str:
+        return f"{self.__class__.__name__}.{self.name}"
+
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__name__}.{self.name}>"
 
 
 class Repetition(enum.Enum):
@@ -113,7 +129,7 @@ class _LdBase(CopyOp):
         :raises OpError: If pack parameter is not a Pack instance
         """
         # Arch verification
-        arch = CuTeDSL._get_dsl().get_arch_enum()
+        arch = BaseDSL._get_dsl().get_arch_enum()
         if arch not in self.admissible_archs:
             raise OpError(
                 self,
@@ -161,7 +177,12 @@ class Ld16x64bOp(_LdBase):
     """
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "Ld16x64bTrait":
         """
         Create a trait object for the 16x64b TMEM load operation.
@@ -188,7 +209,7 @@ class Ld16x64bOp(_LdBase):
             self.repeat.value,
             ir.UnitAttr.get() if self.pack == Pack.PACK_16b_IN_32b else None,
         )
-        return Ld16x64bTrait(cute.make_atom(ty, loc=loc, ip=ip))
+        return Ld16x64bTrait(make_atom(ty, loc=loc, ip=ip))
 
 
 class Ld16x64bTrait(Trait):
@@ -223,7 +244,12 @@ class Ld16x128bOp(_LdBase):
             )
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "Ld16x128bTrait":
         """
         Create a trait object for the 16x128b TMEM load operation.
@@ -246,7 +272,7 @@ class Ld16x128bOp(_LdBase):
             self.repeat.value,
             ir.UnitAttr.get() if self.pack == Pack.PACK_16b_IN_32b else None,
         )
-        return Ld16x128bTrait(cute.make_atom(ty, loc=loc, ip=ip))
+        return Ld16x128bTrait(make_atom(ty, loc=loc, ip=ip))
 
 
 class Ld16x128bTrait(Trait):
@@ -281,7 +307,12 @@ class Ld16x256bOp(_LdBase):
             )
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "Ld16x256bTrait":
         """
         Create a trait object for the 16x256b TMEM load operation.
@@ -304,7 +335,7 @@ class Ld16x256bOp(_LdBase):
             self.repeat.value,
             ir.UnitAttr.get() if self.pack == Pack.PACK_16b_IN_32b else None,
         )
-        return Ld16x256bTrait(cute.make_atom(ty, loc=loc, ip=ip))
+        return Ld16x256bTrait(make_atom(ty, loc=loc, ip=ip))
 
 
 class Ld16x256bTrait(Trait):
@@ -321,7 +352,12 @@ class Ld16x32bx2Op(_LdBase):
     """
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "Ld16x32bx2Trait":
         """
         Create a trait object for the 16x32bx2 TMEM load operation.
@@ -344,7 +380,7 @@ class Ld16x32bx2Op(_LdBase):
             self.repeat.value,
             ir.UnitAttr.get() if self.pack == Pack.PACK_16b_IN_32b else None,
         )
-        return Ld16x32bx2Trait(cute.make_atom(ty, loc=loc, ip=ip))
+        return Ld16x32bx2Trait(make_atom(ty, loc=loc, ip=ip))
 
 
 class Ld16x32bx2Trait(Trait):
@@ -361,7 +397,12 @@ class Ld32x32bOp(_LdBase):
     """
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "Ld32x32bTrait":
         """
         Create a trait object for the 32x32b TMEM load operation.
@@ -384,11 +425,113 @@ class Ld32x32bOp(_LdBase):
             self.repeat.value,
             ir.UnitAttr.get() if self.pack == Pack.PACK_16b_IN_32b else None,
         )
-        return Ld32x32bTrait(cute.make_atom(ty, loc=loc, ip=ip))
+        return Ld32x32bTrait(make_atom(ty, loc=loc, ip=ip))
 
 
 class Ld32x32bTrait(Trait):
     pass
+
+
+@dataclass(frozen=True)
+class LdRed16x32bx2Op(_LdBase):
+    """
+    16x32bx2 TMEM load Reduce Operation.
+
+    See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-ld>`__.
+    This Operation corresponds to the ``.red`` and ``.16x32bx2`` qualifiers.
+    """
+
+    redOp: TmemLoadRedOp = TmemLoadRedOp.MAX
+    nan: bool = False
+    half_split_off: int = 0
+
+    def _make_trait(
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
+    ) -> "LdRed16x32bx2Trait":
+        """
+        Create a trait object for the 16x32bx2 TMEM load Reduce operation.
+
+        :param copy_internal_type: The data type for the copy operation
+        :type copy_internal_type: Type[Numeric]
+        :param loc: MLIR location information for debugging, defaults to None
+        :type loc: optional
+        :param ip: MLIR insertion point for code generation, defaults to None
+        :type ip: optional
+        :param kwargs: Additional keyword arguments
+        :type kwargs: dict
+        :return: A trait object for this load operation
+        :rtype: LdRed16x32bx2Trait
+        """
+        ty = _cute_nvgpu_ir.CopyAtomSM10xTmemLoadRedType.get(
+            copy_internal_type.mlir_type,
+            16,
+            32,
+            self.repeat.value,
+            self.redOp.value,
+            ir.UnitAttr.get() if self.nan else None,
+            ir.IntegerAttr.get(ir.IntegerType.get_signless(32), self.half_split_off),
+        )
+        return LdRed16x32bx2Trait(make_atom(ty, loc=loc, ip=ip))
+
+
+class LdRed16x32bx2Trait(Trait):
+    pass
+
+
+@dataclass(frozen=True)
+class LdRed32x32bOp(_LdBase):
+    """
+    32x32b TMEM load Reduce Operation.
+
+    See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-ld>`__.
+    This Operation corresponds to the ``red`` and ``.32x32`` qualifiers.
+    """
+
+    redOp: TmemLoadRedOp = TmemLoadRedOp.MAX
+    nan: bool = False
+
+    def _make_trait(
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
+    ) -> "LdRed32x32bTrait":
+        """
+        Create a trait object for the 32x32b TMEM load Reduce operation.
+
+        :param copy_internal_type: The data type for the copy operation
+        :type copy_internal_type: Type[Numeric]
+        :param loc: MLIR location information for debugging, defaults to None
+        :type loc: optional
+        :param ip: MLIR insertion point for code generation, defaults to None
+        :type ip: optional
+        :param kwargs: Additional keyword arguments
+        :type kwargs: dict
+        :return: A trait object for this load operation
+        :rtype: LdRed32x32bTrait
+        """
+        ty = _cute_nvgpu_ir.CopyAtomSM10xTmemLoadRedType.get(
+            copy_internal_type.mlir_type,
+            32,
+            32,
+            self.repeat.value,
+            self.redOp.value,
+            ir.UnitAttr.get() if self.nan else None,
+            None,
+        )
+        return LdRed32x32bTrait(make_atom(ty, loc=loc, ip=ip))
+
+
+class LdRed32x32bTrait(Trait):
+    pass
+
 
 
 @dataclass(frozen=True)
@@ -416,7 +559,7 @@ class _StBase(CopyOp):
 
     def __post_init__(self) -> None:
         # Arch verification
-        arch = CuTeDSL._get_dsl().get_arch_enum()
+        arch = BaseDSL._get_dsl().get_arch_enum()
         if arch not in self.admissible_archs:
             raise OpError(
                 self,
@@ -455,7 +598,12 @@ class St16x64bOp(_StBase):
     """
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "St16x64bTrait":
         """
         Create a trait object for the 16x64b TMEM store operation.
@@ -478,7 +626,7 @@ class St16x64bOp(_StBase):
             self.repeat.value,
             ir.UnitAttr.get() if self.unpack == Unpack.UNPACK_32b_IN_16b else None,
         )
-        return St16x64bTrait(cute.make_atom(ty, loc=loc, ip=ip))
+        return St16x64bTrait(make_atom(ty, loc=loc, ip=ip))
 
 
 class St16x64bTrait(Trait):
@@ -504,7 +652,12 @@ class St16x128bOp(_StBase):
             )
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "St16x128bTrait":
         ty = _cute_nvgpu_ir.CopyAtomSM100TmemStoreType.get(
             copy_internal_type.mlir_type,
@@ -513,7 +666,7 @@ class St16x128bOp(_StBase):
             self.repeat.value,
             ir.UnitAttr.get() if self.unpack == Unpack.UNPACK_32b_IN_16b else None,
         )
-        return St16x128bTrait(cute.make_atom(ty, loc=loc, ip=ip))
+        return St16x128bTrait(make_atom(ty, loc=loc, ip=ip))
 
 
 class St16x128bTrait(Trait):
@@ -539,7 +692,12 @@ class St16x256bOp(_StBase):
             )
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "St16x256bTrait":
         ty = _cute_nvgpu_ir.CopyAtomSM100TmemStoreType.get(
             copy_internal_type.mlir_type,
@@ -548,7 +706,7 @@ class St16x256bOp(_StBase):
             self.repeat.value,
             ir.UnitAttr.get() if self.unpack == Unpack.UNPACK_32b_IN_16b else None,
         )
-        return St16x256bTrait(cute.make_atom(ty, loc=loc, ip=ip))
+        return St16x256bTrait(make_atom(ty, loc=loc, ip=ip))
 
 
 class St16x256bTrait(Trait):
@@ -565,7 +723,12 @@ class St16x32bx2Op(_StBase):
     """
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "St16x32bx2Trait":
         ty = _cute_nvgpu_ir.CopyAtomSM100TmemStoreType.get(
             copy_internal_type.mlir_type,
@@ -574,7 +737,7 @@ class St16x32bx2Op(_StBase):
             self.repeat.value,
             ir.UnitAttr.get() if self.unpack == Unpack.UNPACK_32b_IN_16b else None,
         )
-        return St16x32bx2Trait(cute.make_atom(ty, loc=loc, ip=ip))
+        return St16x32bx2Trait(make_atom(ty, loc=loc, ip=ip))
 
 
 class St16x32bx2Trait(Trait):
@@ -591,7 +754,12 @@ class St32x32bOp(_StBase):
     """
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "St32x32bTrait":
         ty = _cute_nvgpu_ir.CopyAtomSM100TmemStoreType.get(
             copy_internal_type.mlir_type,
@@ -600,7 +768,7 @@ class St32x32bOp(_StBase):
             self.repeat.value,
             ir.UnitAttr.get() if self.unpack == Unpack.UNPACK_32b_IN_16b else None,
         )
-        return St32x32bTrait(cute.make_atom(ty, loc=loc, ip=ip))
+        return St32x32bTrait(make_atom(ty, loc=loc, ip=ip))
 
 
 class St32x32bTrait(Trait):
@@ -618,18 +786,23 @@ class _S2TCopyBase(CopyOp):
 
     :param cta_group: Cooperative Thread Array (CTA) group configuration
     :type cta_group: CtaGroup
-    :raises OpError: If the current architecture is not SM100f family or if invalid parameters are provided
+    :raises OpError: If the current architecture is not SM100f or SM110f
+        family or if invalid parameters are provided
     """
 
     cta_group: CtaGroup
 
     def __post_init__(self) -> None:
         # Arch verification
-        arch = CuTeDSL._get_dsl().get_arch_enum()
-        if not arch.is_family_of(Arch.sm_100f):
+        arch = BaseDSL._get_dsl().get_arch_enum()
+        # S2T tcgen05 copy encodings are valid on both SM100 and Thor SM110.
+        if not (arch.is_family_of(Arch.sm_100f) or arch.is_family_of(Arch.sm_110f)):
+            supported = Arch.filter(
+                lambda a: a.is_family_of(Arch.sm_100f) or a.is_family_of(Arch.sm_110f)
+            )
             raise OpError(
                 self,
-                f"expects arch to be one of {Arch.filter(lambda arch: arch.is_family_of(Arch.sm_100f))}, but got {arch}",
+                f"expects arch to be one of {supported}, but got {arch}",
                 suggestion="Ensure env CUTE_DSL_ARCH matches your GPU architecture",
             )
         # Verify that the user provided enum values
@@ -655,10 +828,31 @@ class Cp128x256bOp(_S2TCopyBase):
 
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=tcgen05#tcgen05-instructions-tcgen05-cp>`__.
     This Operation corresponds to the ``.128x256b`` qualifier.
+
+    SMEM to TMEM copy operations should be issued by a single thread. The DSL automatically handles this by
+    implicitly adding ``elect_one()`` around the copy operation.
+
+    .. code-block:: python
+
+        # CORRECT: SMEM to TMEM copy without elect_one
+        cute.copy(
+            s2t_atom,
+            smem_tensor,
+            tmem_tensor,
+        )
+
+        # WRONG: Do NOT wrap in elect_one (can cause deadlock)
+        with cute.arch.elect_one():  # INCORRECT
+            cute.copy(s2t_atom, smem_tensor, tmem_tensor)
     """
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "Cp128x256bTrait":
         """
         Create a trait object for the 128x256b SMEM to TMEM copy operation.
@@ -681,7 +875,7 @@ class Cp128x256bOp(_S2TCopyBase):
             self.cta_group.value,
             _cute_nvgpu_ir.CopyS2TBroadcast.none,
         )
-        return Cp128x256bTrait(cute.make_atom(ty, loc=loc, ip=ip))
+        return Cp128x256bTrait(make_atom(ty, loc=loc, ip=ip))
 
 
 class Cp128x256bTrait(Trait):
@@ -695,10 +889,31 @@ class Cp128x128bOp(_S2TCopyBase):
 
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=tcgen05#tcgen05-instructions-tcgen05-cp>`__.
     This Operation corresponds to the ``.128x128b`` qualifier.
+
+    SMEM to TMEM copy operations should be issued by a single thread. The DSL automatically handles this by
+    implicitly adding ``elect_one()`` around the copy operation.
+
+    .. code-block:: python
+
+        # CORRECT: SMEM to TMEM copy without elect_one
+        cute.copy(
+            s2t_atom,
+            smem_tensor,
+            tmem_tensor,
+        )
+
+        # WRONG: Do NOT wrap in elect_one (can cause deadlock)
+        with cute.arch.elect_one():  # INCORRECT
+            cute.copy(s2t_atom, smem_tensor, tmem_tensor)
     """
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "Cp128x128bTrait":
         ty = _cute_nvgpu_ir.CopyAtomSM100CopyS2TType.get(
             copy_internal_type.mlir_type,
@@ -707,7 +922,7 @@ class Cp128x128bOp(_S2TCopyBase):
             self.cta_group.value,
             _cute_nvgpu_ir.CopyS2TBroadcast.none,
         )
-        return Cp128x128bTrait(cute.make_atom(ty, loc=loc, ip=ip))
+        return Cp128x128bTrait(make_atom(ty, loc=loc, ip=ip))
 
 
 class Cp128x128bTrait(Trait):
@@ -721,10 +936,31 @@ class Cp4x256bOp(_S2TCopyBase):
 
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=tcgen05#tcgen05-instructions-tcgen05-cp>`__.
     This Operation corresponds to the ``.4x256b`` qualifier.
+
+    SMEM to TMEM copy operations should be issued by a single thread. The DSL automatically handles this by
+    implicitly adding ``elect_one()`` around the copy operation.
+
+    .. code-block:: python
+
+        # CORRECT: SMEM to TMEM copy without elect_one
+        cute.copy(
+            s2t_atom,
+            smem_tensor,
+            tmem_tensor,
+        )
+
+        # WRONG: Do NOT wrap in elect_one (can cause deadlock)
+        with cute.arch.elect_one():  # INCORRECT
+            cute.copy(s2t_atom, smem_tensor, tmem_tensor)
     """
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "Cp4x256bTrait":
         ty = _cute_nvgpu_ir.CopyAtomSM100CopyS2TType.get(
             copy_internal_type.mlir_type,
@@ -733,7 +969,7 @@ class Cp4x256bOp(_S2TCopyBase):
             self.cta_group.value,
             _cute_nvgpu_ir.CopyS2TBroadcast.none,
         )
-        return Cp4x256bTrait(cute.make_atom(ty, loc=loc, ip=ip))
+        return Cp4x256bTrait(make_atom(ty, loc=loc, ip=ip))
 
 
 class Cp4x256bTrait(Trait):
@@ -747,10 +983,31 @@ class Cp4x32x128bOp(_S2TCopyBase):
 
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=tcgen05#tcgen05-instructions-tcgen05-cp>`__.
     This Operation corresponds to the ``.32x128b`` qualifier with ``warpx4`` broadcast qualifier enabled.
+
+    SMEM to TMEM copy operations should be issued by a single thread. The DSL automatically handles this by
+    implicitly adding ``elect_one()`` around the copy operation.
+
+    .. code-block:: python
+
+        # CORRECT: SMEM to TMEM copy without elect_one
+        cute.copy(
+            s2t_atom,
+            smem_tensor,
+            tmem_tensor,
+        )
+
+        # WRONG: Do NOT wrap in elect_one (can cause deadlock)
+        with cute.arch.elect_one():  # INCORRECT
+            cute.copy(s2t_atom, smem_tensor, tmem_tensor)
     """
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "Cp4x32x128bTrait":
         ty = _cute_nvgpu_ir.CopyAtomSM100CopyS2TType.get(
             copy_internal_type.mlir_type,
@@ -759,7 +1016,7 @@ class Cp4x32x128bOp(_S2TCopyBase):
             self.cta_group.value,
             _cute_nvgpu_ir.CopyS2TBroadcast.x4,
         )
-        return Cp4x32x128bTrait(cute.make_atom(ty, loc=loc, ip=ip))
+        return Cp4x32x128bTrait(make_atom(ty, loc=loc, ip=ip))
 
 
 class Cp4x32x128bTrait(Trait):
@@ -773,10 +1030,31 @@ class Cp2x64x128b0213Op(_S2TCopyBase):
 
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=tcgen05#tcgen05-instructions-tcgen05-cp>`__.
     This Operation corresponds to the ``.64x128b`` qualifier with ``.warpx2::02_13`` broadcast qualifier enabled.
+
+    SMEM to TMEM copy operations should be issued by a single thread. The DSL automatically handles this by
+    implicitly adding ``elect_one()`` around the copy operation.
+
+    .. code-block:: python
+
+        # CORRECT: SMEM to TMEM copy without elect_one
+        cute.copy(
+            s2t_atom,
+            smem_tensor,
+            tmem_tensor,
+        )
+
+        # WRONG: Do NOT wrap in elect_one (can cause deadlock)
+        with cute.arch.elect_one():  # INCORRECT
+            cute.copy(s2t_atom, smem_tensor, tmem_tensor)
     """
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "Cp2x64x128b0213Trait":
         ty = _cute_nvgpu_ir.CopyAtomSM100CopyS2TType.get(
             copy_internal_type.mlir_type,
@@ -785,7 +1063,7 @@ class Cp2x64x128b0213Op(_S2TCopyBase):
             self.cta_group.value,
             _cute_nvgpu_ir.CopyS2TBroadcast.lw_0213,
         )
-        return Cp2x64x128b0213Trait(cute.make_atom(ty, loc=loc, ip=ip))
+        return Cp2x64x128b0213Trait(make_atom(ty, loc=loc, ip=ip))
 
 
 class Cp2x64x128b0213Trait(Trait):
@@ -799,10 +1077,32 @@ class Cp2x64x128b0123Op(_S2TCopyBase):
 
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=tcgen05#tcgen05-instructions-tcgen05-cp>`__.
     This Operation corresponds to the ``.64x128b`` qualifier with ``.warpx2::01_23`` broadcast qualifier enabled.
+
+    SMEM to TMEM copy operations should be issued by a single thread. The DSL automatically handles this by
+    implicitly adding ``elect_one()`` around the copy operation.
+
+    .. code-block:: python
+
+        # CORRECT: SMEM to TMEM copy without elect_one
+        cute.copy(
+            s2t_atom,
+            smem_tensor,
+            tmem_tensor,
+        )
+
+        # WRONG: Do NOT wrap in elect_one (can cause deadlock)
+        with cute.arch.elect_one():  # INCORRECT
+            cute.copy(s2t_atom, smem_tensor, tmem_tensor)
+
     """
 
     def _make_trait(
-        self, copy_internal_type: Type[Numeric], *, loc=None, ip=None, **kwargs
+        self,
+        copy_internal_type: Type[Numeric],
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
     ) -> "Cp2x64x128b0123Trait":
         ty = _cute_nvgpu_ir.CopyAtomSM100CopyS2TType.get(
             copy_internal_type.mlir_type,
@@ -811,7 +1111,7 @@ class Cp2x64x128b0123Op(_S2TCopyBase):
             self.cta_group.value,
             _cute_nvgpu_ir.CopyS2TBroadcast.lw_0123,
         )
-        return Cp2x64x128b0123Trait(cute.make_atom(ty, loc=loc, ip=ip))
+        return Cp2x64x128b0123Trait(make_atom(ty, loc=loc, ip=ip))
 
 
 class Cp2x64x128b0123Trait(Trait):

@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -32,6 +32,7 @@
 
 #pragma once
 
+#include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "cutlass/gemm/kernel/sm90_tile_scheduler_group.hpp"
@@ -110,18 +111,21 @@ public:
   }
 
   static bool
-  can_implement(Arguments const& args) {
+  can_implement(Arguments const& args, KernelHardwareInfo const&) {
     return true;
   }
 
   CUTLASS_DEVICE
   PersistentTileSchedulerSm100Group() { }
-
+  
+  // Note: constructing this tile scheduler can touch global memory that was
+  // written to by the prior kernel.
   CUTLASS_DEVICE
   PersistentTileSchedulerSm100Group(CLCResponse* clc_response_ptr, Params const& params)
     : scheduler_params(params),
       scheduler_sm90(params.params_sm90_, clc_response_ptr) { }
-
+  // Note: constructing this tile scheduler can touch global memory that was
+  // written to by the prior kernel.
   CUTLASS_DEVICE
   PersistentTileSchedulerSm100Group(CLCResponse* clc_response_ptr, Params const& params, dim3 /* block_id_in_cluster */)
     : scheduler_params(params),
@@ -161,9 +165,6 @@ public:
 
     // Given device SM count, set grid size s.t. we do not launch more thread blocks than we can run concurrently
     Arguments args{};
-    if constexpr (!std::is_const_v<decltype(args.max_swizzle_size)>) {
-      args.max_swizzle_size = 1 << params.params_sm90_.log_swizzle_size_;
-    }
     args.raster_order = params.params_sm90_.raster_order_ == RasterOrder::AlongN ? RasterOrderOptions::AlongN : RasterOrderOptions::AlongM;
 
     return Params::get_grid_shape(

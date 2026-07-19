@@ -1,23 +1,41 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Use of this software is governed by the terms and conditions of the
 # NVIDIA End User License Agreement (EULA), available at:
-# https://docs.nvidia.com/cutlass/media/docs/pythonDSL/license.html
+# https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/license.html
 #
 # Any use, reproduction, disclosure, or distribution of this software
 # and related documentation outside the scope permitted by the EULA
 # is strictly prohibited.
 
+
 import math
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Type, Union
 
 from cutlass._mlir import ir
-from cutlass.cutlass_dsl import for_generate, yield_out, if_generate, dsl_user_op
+from cutlass.cutlass_dsl import (
+    BaseDSL,
+    for_generate,
+    yield_out,
+    if_generate,
+    dsl_user_op,
+    LoopUnroll,
+)
 import cutlass._mlir.dialects.cute as _cute_ir
 import cutlass._mlir.dialects.cute_nvgpu as _cute_nvgpu_ir
 
-from .typing import Tensor, Int64, Int16, AddressSpace
+from .typing import (
+    Numeric,
+    Pointer,
+    Tensor,
+    Boolean,
+    Int8,
+    Int64,
+    Int16,
+    AddressSpace,
+    is_int_tuple_type,
+)
 from .core import (
     rank,
     is_static,
@@ -28,21 +46,36 @@ from .core import (
     logical_divide,
     append_ones,
     group_modes,
+    slice_,
 )
-from .atom import MmaAtom, CopyAtom, make_atom
+from .atom import (
+    MmaAtom,
+    CopyAtom,
+    make_atom,
+    _normalize_variadic_tensor_operand,
+    copy_atom_call,
+)
+from .nvgpu.common import (
+    CacheEvictionPriority,
+    CopyG2ROp,
+    CopyR2GOp,
+    CopyS2ROp,
+    CopyR2SOp,
+    OpError,
+)
 
 
 @dsl_user_op
 def gemm(
     atom: MmaAtom,
     d: Tensor,
-    a: Tensor,
-    b: Tensor,
+    a: Union[Tensor, List[Tensor], Tuple[Tensor, ...]],
+    b: Union[Tensor, List[Tensor], Tuple[Tensor, ...]],
     c: Tensor,
     *,
-    loc=None,
-    ip=None,
-    **kwargs,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+    **kwargs: Any,
 ) -> None:
     """The GEMM algorithm.
 
@@ -62,15 +95,32 @@ def gemm(
     - Dispatch [4]: (V,M) x (V,N) => (V,M,N)  => (V,M,1) x (V,N,1) => (V,M,N)
     - Dispatch [5]: (V,M,K) x (V,N,K) => (V,M,N)
 
+    The operands `a` and `b` are variadic, each containing a variable number of tensors:
+
+    - For regular GEMM, `a` and `b` contain the GEMM A and B tensors respectively.
+    - For GEMM with auxiliary operands, `a` and `b` contain the GEMM A and B tensors followed by
+      their respective auxiliary tensors.
+
+    Auxiliary operands examples:
+
+    - For BlockScaledGemm, `a` = [A, SFA] and `b` = [B, SFB].
+    - For SparseGemm, `a` = [A, E] and `b` = [B].
+    - For BlockScaledSparseGemm, `a` = [A, SFA, E] and `b` = [B, SFB].
+
+    Runtime keyword arguments in ``kwargs`` are forwarded to the underlying MMA atom trait.
+    For SM100 tcgen05 MMA atoms, ``disable_output_lane`` provides a per-lane
+    write-disable mask for ``tcgen05.mma.disable_output_lane`` lowering.
+    The expected lane count is 4 for ``cta_group::1`` and 8 for ``cta_group::2``.
+
     :param atom: MMA atom
     :type atom: MmaAtom
-    :param d: Destination tensor
+    :param d: Destination tensor (output accumulator)
     :type d: Tensor
-    :param a: First source tensor
-    :type a: Tensor
-    :param b: Second source tensor
-    :type b: Tensor
-    :param c: Third source tensor
+    :param a: A tensor or list of tensors containing the GEMM A tensor and optional auxiliary tensors
+    :type a: Union[Tensor, List[Tensor], Tuple[Tensor, ...]]
+    :param b: B tensor or list of tensors containing the GEMM B tensor and optional auxiliary tensors
+    :type b: Union[Tensor, List[Tensor], Tuple[Tensor, ...]]
+    :param c: Input accumulator tensor
     :type c: Tensor
     :param loc: Source location for MLIR, defaults to None
     :type loc: Optional[Location], optional
@@ -82,8 +132,13 @@ def gemm(
     :rtype: None
     """
 
-    a_rank = rank(a.shape)
-    b_rank = rank(b.shape)
+    # Normalize A/B to lists for variadic IR operands, while keeping old API working.
+    a_list = _normalize_variadic_tensor_operand(a, "a")
+    b_list = _normalize_variadic_tensor_operand(b, "b")
+
+    # Rank validations based on the primary A/B tensors (guaranteed non-empty)
+    a_rank = rank(a_list[0].shape)
+    b_rank = rank(b_list[0].shape)
     c_rank = rank(c.shape)
     d_rank = rank(d.shape)
 
@@ -104,11 +159,79 @@ def gemm(
             raise ValueError("`c` must have rank 3 when `a` has rank 3")
 
     value = atom._unpack(loc=loc, ip=ip, **kwargs)
-    return _cute_ir.gemm(value, d.value, a.value, b.value, c.value, loc=loc, ip=ip)
+    a_vals = [t.value for t in a_list]
+    b_vals = [t.value for t in b_list]
+    return _cute_ir.gemm(value, d.value, a_vals, b_vals, c.value, loc=loc, ip=ip)
+
+
+def _make_copy_atom(
+    copy_internal_type: Type[Numeric],
+    num_bits_per_copy: int,
+    src_memspace: AddressSpace,
+    dst_memspace: AddressSpace,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+    **mem_attrs: Any,
+) -> ir.Value:
+    """Create a copy atom, using the universal copy by default.
+
+    When no ``mem_attrs`` are provided, the universal copy atom is used.
+    Otherwise, the function dispatches to a specialized copy op based on the
+    source/destination memory spaces and forwards the memory attributes:
+      - gmem -> rmem: ``CopyG2ROp``
+      - rmem -> gmem: ``CopyR2GOp``
+      - smem -> rmem: ``CopyS2ROp``
+      - rmem -> smem: ``CopyR2SOp``
+
+    A ``ValueError`` is raised if no specialized op matches the memory-space pair.
+    """
+
+    if not mem_attrs:
+        atom_type = _cute_nvgpu_ir.CopyAtomSIMTSyncCopyType.get(
+            copy_internal_type.mlir_type,
+            num_bits_per_copy,
+        )
+        return make_atom(atom_type, loc=loc, ip=ip)
+
+    # Specialized path: dispatch based on memory spaces.
+    op: Union[
+        CopyG2ROp,
+        CopyR2GOp,
+        CopyS2ROp,
+        CopyR2SOp,
+    ]
+    if src_memspace == AddressSpace.gmem and dst_memspace == AddressSpace.rmem:
+        op = CopyG2ROp()
+    elif src_memspace == AddressSpace.rmem and dst_memspace == AddressSpace.gmem:
+        op = CopyR2GOp()
+    elif src_memspace == AddressSpace.smem and dst_memspace == AddressSpace.rmem:
+        op = CopyS2ROp()
+    elif src_memspace == AddressSpace.rmem and dst_memspace == AddressSpace.smem:
+        op = CopyR2SOp()
+    else:
+        raise ValueError(
+            f"Memory attributes {set(mem_attrs)} are not supported for "
+            f"{src_memspace} -> {dst_memspace} copies (no specialized op available)."
+        )
+    trait = op._make_trait(
+        copy_internal_type,
+        num_bits_per_copy=num_bits_per_copy,
+        loc=loc,
+        ip=ip,
+        **mem_attrs,
+    )
+    return trait.value
 
 
 @dsl_user_op
-def basic_copy(src: Tensor, dst: Tensor, *, loc=None, ip=None) -> None:
+def basic_copy(
+    src: Tensor,
+    dst: Tensor,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
     """Performs a basic element-wise copy.
 
     This functions **assumes** the following pre-conditions:
@@ -128,11 +251,15 @@ def basic_copy(src: Tensor, dst: Tensor, *, loc=None, ip=None) -> None:
     """
 
     if is_static(src.shape) and is_static(dst.shape):
+        # Boolean (i1) is stored as i8 in memory; use i8 for the copy atom
+        src_elem_type = Int8 if src.element_type is Boolean else src.element_type
+        assert not is_int_tuple_type(src_elem_type)
         simt_copy_ty = _cute_nvgpu_ir.CopyAtomSIMTSyncCopyType.get(
-            src.element_type.mlir_type, src.element_type.width
+            src_elem_type.mlir_type,
+            src_elem_type.width,
         )
         simt_copy = make_atom(simt_copy_ty, loc=loc, ip=ip)
-        return _cute_ir.copy(simt_copy, src.value, dst.value, loc=loc, ip=ip)
+        return _cute_ir.copy(simt_copy, [src.value], [dst.value], loc=loc, ip=ip)
 
     s = size(dst, loc=loc, ip=ip)
     # Always generate an scf.for Op when one of the tensors is dynamic
@@ -142,7 +269,14 @@ def basic_copy(src: Tensor, dst: Tensor, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def basic_copy_if(pred: Tensor, src: Tensor, dst: Tensor, *, loc=None, ip=None) -> None:
+def basic_copy_if(
+    pred: Tensor,
+    src: Tensor,
+    dst: Tensor,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
     """Performs a basic predicated element-wise copy.
 
     This functions **assumes** the following pre-conditions:
@@ -153,7 +287,10 @@ def basic_copy_if(pred: Tensor, src: Tensor, dst: Tensor, *, loc=None, ip=None) 
     is fully unrolled.
 
     """
-    if src.element_type.width != dst.element_type.width:
+    src_elem_type = Int8 if src.element_type is Boolean else src.element_type
+    dst_elem_type = Int8 if dst.element_type is Boolean else dst.element_type
+    assert not is_int_tuple_type(src_elem_type) and not is_int_tuple_type(dst_elem_type)
+    if src_elem_type.width != dst_elem_type.width:
         raise NotImplementedError(
             "basic_copy_if currently only supports equal source and destination "
             "element type bit width"
@@ -165,7 +302,7 @@ def basic_copy_if(pred: Tensor, src: Tensor, dst: Tensor, *, loc=None, ip=None) 
     s = size(dst, loc=loc, ip=ip)
     # Always generate an scf.for Op when one of the tensors is dynamic
     for i in for_generate(0, s, loc=loc, ip=ip):
-        if_generate(pred[i], lambda: dst.__setitem__(i, src[i]), loc=loc, ip=ip)  # type: ignore
+        if_generate(pred[i], lambda: dst.__setitem__(i, src[i]), loc=loc, ip=ip)
         yield_out()
 
 
@@ -173,7 +310,12 @@ def basic_copy_if(pred: Tensor, src: Tensor, dst: Tensor, *, loc=None, ip=None) 
 # - verify size(src) == size(dst) == size(prd)
 # - fully unroll the loop for now
 def _basic_copy_if_static(
-    pred: Tensor, src: Tensor, dst: Tensor, *, loc=None, ip=None
+    pred: Tensor,
+    src: Tensor,
+    dst: Tensor,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> None:
     assert is_static(src.shape) and is_static(dst.shape) and is_static(pred.shape)
     if size(src, loc=loc, ip=ip) != size(dst, loc=loc, ip=ip):
@@ -182,21 +324,34 @@ def _basic_copy_if_static(
         )
     # Fully unrolled loop in the static case for now
     for i in range(size(dst, loc=loc, ip=ip)):
-        if_generate(pred[i], lambda: dst.__setitem__(i, src[i]), loc=loc, ip=ip)  # type: ignore
+        if_generate(pred[i], lambda: dst.__setitem__(i, src[i]), loc=loc, ip=ip)
 
 
 @dsl_user_op
-def autovec_copy(src: Tensor, dst: Tensor, *, loc=None, ip=None) -> None:
+def autovec_copy(
+    src: Tensor,
+    dst: Tensor,
+    *,
+    l1c_evict_priority: CacheEvictionPriority = CacheEvictionPriority.EVICT_NORMAL,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
     """
     Auto-vectorization SIMT copy policy.
 
-    Given a source and destination tensors that are statically shaped, this policy figures out the
-    largest safe vector width that the copy instruction can take and performs the copy.
+    Given a source and destination tensors that are statically shaped, this policy
+    figures out the largest safe vector width that the copy instruction can take
+    and performs the copy. Any extra memory attributes are forwarded to the specialized
+    copy op.
+
     """
-    if src.element_type.width != dst.element_type.width:
+    src_elem_type = Int8 if src.element_type is Boolean else src.element_type
+    dst_elem_type = Int8 if dst.element_type is Boolean else dst.element_type
+    assert not is_int_tuple_type(src_elem_type) and not is_int_tuple_type(dst_elem_type)
+    if src_elem_type.width != dst_elem_type.width:
         raise NotImplementedError(
-            "autovec_copy currently only supports equal source and destination "
-            "element type bit width"
+            "autovec_copy only supports equal source and destination "
+            f"element type bit widths, got {src_elem_type} and {dst_elem_type}"
         )
 
     # We are going to dispatch to copy-with-atom which requires shapes to be static
@@ -212,20 +367,23 @@ def autovec_copy(src: Tensor, dst: Tensor, *, loc=None, ip=None) -> None:
     # - the maximum alignment of the layouts
     # - the maximum alignment of the pointers
 
-    upper_bound = math.gcd(src.layout.max_alignment, dst.layout.max_alignment)
+    upper_bound = math.gcd(src.layout.max_alignment, dst.layout.max_alignment)  # type: ignore[union-attr]
     upper_bound = math.gcd(upper_bound, num_common_elements)
-    upper_bound *= src.element_type.width
+    upper_bound *= src_elem_type.width
 
     # For our instructions, the alignment of the pointer is an upper bound to the vector width
     # max_alignment, as opposed to alignment, takes into account possible address swizzling
-    upper_bound = math.gcd(upper_bound, src.iterator.max_alignment * 8)
-    upper_bound = math.gcd(upper_bound, dst.iterator.max_alignment * 8)
+    src_iter = src.iterator
+    dst_iter = dst.iterator
+    assert isinstance(src_iter, Pointer) and isinstance(dst_iter, Pointer)
+    upper_bound = math.gcd(upper_bound, src_iter.max_alignment * 8)
+    upper_bound = math.gcd(upper_bound, dst_iter.max_alignment * 8)
 
-    # Finally, we put a cap at 128b
-    num_bits_per_copy = math.gcd(upper_bound, 128)
+    # Finally, we put a cap at 256b
+    num_bits_per_copy = math.gcd(upper_bound, 256)
 
     if (num_common_elements > 1) and (num_bits_per_copy % 8 == 0):
-        num_common_elements = num_bits_per_copy // src.element_type.width
+        num_common_elements = num_bits_per_copy // src_elem_type.width
 
         # 2 step logical divides ensuring that the divides are valid at every step
         vec_src = logical_divide(src, vec_layout, loc=loc, ip=ip)
@@ -237,64 +395,88 @@ def autovec_copy(src: Tensor, dst: Tensor, *, loc=None, ip=None) -> None:
             vec_dst, make_layout(num_common_elements, loc=loc, ip=ip), loc=loc, ip=ip
         )
 
-        # Dispatch to copy with atom
-        simt_type = _cute_nvgpu_ir.CopyAtomSIMTSyncCopyType.get(
-            src.element_type.mlir_type, num_bits_per_copy
+        # Forward memory attributes that differ from their defaults so _make_copy_atom
+        # falls back to the universal copy when no specialisation is needed.
+        mem_attrs = {}
+        if l1c_evict_priority != CacheEvictionPriority.EVICT_NORMAL:
+            mem_attrs["l1c_evict_priority"] = l1c_evict_priority
+
+        simt_copy_atom = _make_copy_atom(
+            src_elem_type,
+            num_bits_per_copy,
+            src_iter.memspace,
+            dst_iter.memspace,
+            loc=loc,
+            ip=ip,
+            **mem_attrs,
         )
-        simt_copy = make_atom(simt_type, loc=loc, ip=ip)
         return _cute_ir.copy(
-            simt_copy, tiled_src.value, tiled_dst.value, loc=loc, ip=ip
+            simt_copy_atom,
+            [tiled_src.value],
+            [tiled_dst.value],
+            loc=loc,
+            ip=ip,
         )
 
     # Failed to vectorize, use a basic copy
     basic_copy(src, dst, loc=loc, ip=ip)
 
 
-def _parse_auto_multicast_args(
+def _parse_tma_multicast_args(
     kwargs: Dict[str, Any],
 ) -> List[Tuple[str, ir.Attribute]]:
     """
     Parse multicast-related kwargs and return a list of (attr_name, attr) pairs.
 
     This function consumes the following key from kwargs if present:
-      - 'auto_multicast': dict
-          dict: { 'multicast_layout': str, 'use_2cta': bool }
+      - 'tma_multicast': dict with keys:
+          { 'cluster_shape': (m, n), 'multicast_dim': 'M' or 'N',
+            'use_2cta_mma_inst': bool, 'from_block_api': bool }
 
     Returns:
       List of (attr_name, ir.Attribute) pairs to be attached to the op.
       Recognized attributes:
-        - ('multicast_layout', #cute.layout<...>) when a layout string is provided
-        - ('use_2cta', unit) when use_2cta is True
+        - ('multicast_layout', #cute.layout<...>)
+        - ('use_2cta', unit) when use_2cta_mma_inst is True
+        - ('from_block_api', unit) when from_block_api is True
     """
     attr_pairs: List[Tuple[str, ir.Attribute]] = []
 
     # Pop known keys to avoid leaking to trait unpack
-    auto_multicast = kwargs.pop("auto_multicast", None)
+    tma_multicast = kwargs.pop("tma_multicast", None)
 
-    use_2cta: bool = False
-    layout_str: Optional[str] = None
+    if tma_multicast is None:
+        return attr_pairs
 
-    if auto_multicast is not None:
-        if not isinstance(auto_multicast, dict):
-            raise TypeError(
-                "auto_multicast must be a dict with keys 'multicast_layout' and optional 'use_2cta'"
-            )
-        layout_str = auto_multicast.get("multicast_layout", None)
-        use_2cta = bool(auto_multicast.get("use_2cta", False))
+    if not isinstance(tma_multicast, dict):
+        raise TypeError("tma_multicast must be a dict")
 
-    if layout_str is not None:
-        if not isinstance(layout_str, str):
-            raise TypeError(
-                "multicast_layout must be a string representing a CuTe layout, e.g. '(4,2):(1,0)'"
+    # Validate required keys
+    required_keys = ["cluster_shape", "multicast_dim"]
+    for key in required_keys:
+        if key not in tma_multicast:
+            raise KeyError(
+                f"tma_multicast is missing required key '{key}'. "
+                f"Expected keys: {required_keys}"
             )
-        attr_pairs.append(
-            (
-                "multicast_layout",
-                ir.Attribute.parse(f'#cute.layout<"{layout_str}">'),
-            )
+
+    multicast_dim = tma_multicast["multicast_dim"]
+    if multicast_dim not in ("M", "N"):
+        raise ValueError(f"multicast_dim must be 'M' or 'N', got '{multicast_dim}'")
+
+    cluster_m, cluster_n = tma_multicast["cluster_shape"]
+    direction = "(1,0)" if multicast_dim == "M" else "(0,1)"
+    layout_str = f"({cluster_m},{cluster_n}):{direction}"
+
+    attr_pairs.append(
+        (
+            "multicast_layout",
+            ir.Attribute.parse(f'#cute.layout<"{layout_str}">'),
         )
-
-    if use_2cta:
+    )
+    if tma_multicast.get("from_block_api", False):
+        attr_pairs.append(("from_block_api", ir.UnitAttr.get()))
+    if tma_multicast.get("use_2cta_mma_inst", False):
         attr_pairs.append(("use_2cta", ir.UnitAttr.get()))
 
     return attr_pairs
@@ -303,24 +485,27 @@ def _parse_auto_multicast_args(
 @dsl_user_op
 def copy(
     atom: CopyAtom,
-    src: Tensor,
-    dst: Tensor,
+    src: Union[Tensor, List[Tensor], Tuple[Tensor, ...]],
+    dst: Union[Tensor, List[Tensor], Tuple[Tensor, ...]],
     *,
     pred: Optional[Tensor] = None,
-    loc=None,
-    ip=None,
-    **kwargs,
+    unroll_factor: Optional[int] = None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+    **kwargs: Any,
 ) -> None:
     """Facilitates data transfer between two tensors conforming to layout profile ``(V, Rest...)``.
 
     :param atom: Copy atom specifying the transfer operation
     :type atom: CopyAtom
-    :param src: Source tensor with layout profile ``(V, Rest...)``
-    :type src: Tensor
-    :param dst: Destination tensor with layout profile ``(V, Rest...)``
-    :type dst: Tensor
+    :param src: Source tensor or list of tensors with layout profile ``(V, Rest...)``
+    :type src: Union[Tensor, List[Tensor], Tuple[Tensor, ...]]
+    :param dst: Destination tensor or list of tensors with layout profile ``(V, Rest...)``
+    :type dst: Union[Tensor, List[Tensor], Tuple[Tensor, ...]]
     :param pred: Optional predication tensor for conditional transfers, defaults to None
     :type pred: Optional[Tensor], optional
+    :param unroll_factor: Optional unroll count for loop over Rest... modes, defaults to None for fully unroll when Rest... modes are static
+    :type unroll_factor: Optional[int], optional
     :param loc: Source location information, defaults to None
     :type loc: Any, optional
     :param ip: Insertion point, defaults to None
@@ -346,6 +531,12 @@ def copy(
     Source and destination tensors must be partitioned in accordance with the Copy Atom specifications.
     Post-partitioning, both tensors will exhibit a ``(V, Rest...)`` layout profile.
 
+    The operands `src` and `dst` are variadic, each containing a variable number of tensors:
+
+    - For regular copy, `src` and `dst` contain single source and destination tensors respectively.
+    - For copy with auxiliary operands, `src` and `dst` contain the primary tensors followed by
+      their respective auxiliary tensors.
+
     **Precondition:** The size of mode 1 must be equal for both source and destination tensors:
     ``size(src, mode=[1]) == size(dst, mode=[1])``
 
@@ -355,7 +546,7 @@ def copy(
 
     .. code-block:: python
 
-        cute.copy(tma_atom, src, dst, tma_bar_ptr=mbar_ptr, mcast_mask=mask)
+        cute.copy(tma_atom, src, dst, tma_bar_ptr=mbar_ptr, mcast_mask=mask, cache_policy=policy)
 
     Optional predication is supported through an additional tensor parameter. For partitioned tensors with
     logical profile ``((ATOM_V,ATOM_REST),REST,...)``, the predication tensor must maintain profile
@@ -371,50 +562,106 @@ def copy(
           for future releases.
 
     """
-    if isinstance(src.type, _cute_ir.MemRefType) and isinstance(
-        dst.type, _cute_ir.MemRefType
+    # Normalize src/dst to lists for variadic IR operands
+    src_list = _normalize_variadic_tensor_operand(src, "src")
+    dst_list = _normalize_variadic_tensor_operand(dst, "dst")
+
+    # Validate primary tensors (first element)
+    src_primary = src_list[0]
+    dst_primary = dst_list[0]
+
+    if isinstance(
+        src_primary.type,  # type: ignore[attr-defined]
+        _cute_ir.MemRefType,
+    ) and isinstance(
+        dst_primary.type,  # type: ignore[attr-defined]
+        _cute_ir.MemRefType,
     ):
-        if src.element_type.width != dst.element_type.width:
+        src_p_elem_type = src_primary.element_type
+        dst_p_elem_type = dst_primary.element_type
+        assert not is_int_tuple_type(src_p_elem_type) and not is_int_tuple_type(
+            dst_p_elem_type
+        )
+        if len(dst_list) == 1 and src_p_elem_type.width != dst_p_elem_type.width:
             raise TypeError(
                 "`copy` currently only supports equal source and destination "
                 "element type bit width"
             )
 
-    if rank(src) != rank(dst):
-        raise ValueError(
-            "Expected source and destination tensors to have the same rank, "
-            f"but got {rank(src)} and {rank(dst)}"
-        )
-
-    # Canonicalize to at least rank-2 tensors
-    src = group_modes(append_ones(src, up_to_rank=2), 1)
-    dst = group_modes(append_ones(dst, up_to_rank=2), 1)
-    if pred is not None:
-        pred = group_modes(append_ones(pred, up_to_rank=2), 1)
-
-    if is_static(src.shape[1]) and is_static(dst.shape[1]):
-        if size(src, mode=[1]) != size(dst, mode=[1]):
+    if unroll_factor is not None:
+        if not isinstance(unroll_factor, int) or unroll_factor < 1:
             raise ValueError(
-                "Expected source and destination tensors to have the same size in mode-1, "
-                f"but got {size(src, mode=[1])} and {size(dst, mode=[1])}"
+                f"unroll_factor must be a positive integer, but got {unroll_factor}"
             )
 
-    multicast_attr_pairs = _parse_auto_multicast_args(kwargs)
+    if rank(src_primary) != rank(dst_primary):
+        raise ValueError(
+            "Expected source and destination tensors to have the same rank, "
+            f"but got {rank(src_primary)} and {rank(dst_primary)}"
+        )
 
-    value = atom._unpack(loc=loc, ip=ip, **kwargs)
-    if isinstance(pred, Tensor):
-        pred = pred.value
+    # Canonicalize all tensors to at least rank-2
+    src_list = [group_modes(append_ones(t, up_to_rank=2), 1) for t in src_list]  # type: ignore[call-overload]
+    dst_list = [group_modes(append_ones(t, up_to_rank=2), 1) for t in dst_list]  # type: ignore[call-overload]
+    if pred is not None:
+        pred = group_modes(append_ones(pred, up_to_rank=2), 1)  # type: ignore[call-overload]
 
-    op = _cute_ir.copy(value, src.value, dst.value, pred=pred, loc=loc, ip=ip)
+    # Recompute primary references after canonicalization
+    src_primary = src_list[0]
+    dst_primary = dst_list[0]
+    src_primary_shape = src_primary.shape
+    dst_primary_shape = dst_primary.shape
+    assert isinstance(src_primary_shape, tuple)
+    assert isinstance(dst_primary_shape, tuple)
 
-    for name, attr in multicast_attr_pairs:
-        op.attributes[name] = attr
+    if is_static(src_primary_shape[1]) and is_static(dst_primary_shape[1]):
+        if size(src_primary, mode=[1]) != size(dst_primary, mode=[1]):
+            raise ValueError(
+                "Expected source and destination tensors to have the same size in mode-1, "
+                f"but got {size(src_primary, mode=[1])} and {size(dst_primary, mode=[1])}"
+            )
 
-    return op
+    multicast_attr_pairs = _parse_tma_multicast_args(kwargs)
+
+    # Unroll the loop per specified unroll_factor for static RestM case
+    if is_static(src_primary_shape[1]) and unroll_factor is not None:
+        unroll_factor = LoopUnroll(count=unroll_factor)
+        for i in for_generate(
+            0,
+            stop=size(src_primary, mode=[1], loc=loc, ip=ip),
+            unroll=unroll_factor,
+            loc=loc,
+            ip=ip,
+        ):
+            src_atom = [slice_(src, (None, i), loc=loc, ip=ip) for src in src_list]
+            dst_atom = [slice_(dst, (None, i), loc=loc, ip=ip) for dst in dst_list]
+            pred_atom = (
+                slice_(pred, (None, i), loc=loc, ip=ip) if pred is not None else None
+            )
+            copy_atom_call(
+                atom, src_atom, dst_atom, pred=pred_atom, loc=loc, ip=ip, **kwargs
+            )
+            yield_out()
+    else:
+        value = atom._unpack(loc=loc, ip=ip, **kwargs)
+        pred_value = pred.value if isinstance(pred, Tensor) else pred
+
+        src_vals = [t.value for t in src_list]
+        dst_vals = [t.value for t in dst_list]
+        op = _cute_ir.copy(value, src_vals, dst_vals, pred=pred_value, loc=loc, ip=ip)
+
+        for name, attr in multicast_attr_pairs:
+            op.attributes[name] = attr
 
 
 @dsl_user_op
-def prefetch(atom: CopyAtom, src: Tensor, *, loc=None, ip=None) -> None:
+def prefetch(
+    atom: CopyAtom,
+    src: Union[Tensor, List[Tensor], Tuple[Tensor, ...]],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
     """
     The Prefetch algorithm.
 
@@ -423,16 +670,32 @@ def prefetch(atom: CopyAtom, src: Tensor, *, loc=None, ip=None) -> None:
 
     Prefetch accepts Copy Atom but not all are allowed. Currently, only supports TMA prefetch.
 
+    For standard TMA modes (tiled, im2col), pass a single GMEM tensor:
+
     .. code-block:: python
 
-        cute.prefetch(tma_prefetch, src)
+        cute.prefetch(tma_prefetch, tAgA)
+
+    For 2D ``tile::gather4`` mode, pass a list ``[data_tensor, gmem_index_tensor]``
+    (mirrors :func:`cute.copy` for the same mode); see :func:`cute.nvgpu.cpasync.tma_partition`
+    for the gather4 layout conventions:
+
+    .. code-block:: python
+
+        cute.prefetch(tma_atom, [tAgA, tAgI])
+
+    Pass the whole multi-stage partitioned tensors — the lowering's internal loop walks every
+    rest-dimension entry, so a single ``cute.prefetch`` call covers every stage and lives outside
+    any per-stage loop.
 
     For Copy Atoms that require single-threaded execution, the copy op automatically handles thread
     election internally. Manual thread selection is not required in such cases.
     """
+    src_list = _normalize_variadic_tensor_operand(src, "src")
+
     dummy_tma_bar_ptr = make_ptr(Int64, 0, AddressSpace.smem, loc=loc, ip=ip)
     dummy_mcast_mask = Int16(0)
     value = atom._unpack(
         loc=loc, ip=ip, tma_bar_ptr=dummy_tma_bar_ptr, mcast_mask=dummy_mcast_mask
     )
-    return _cute_ir.prefetch(value, src.value, loc=loc, ip=ip)
+    return _cute_ir.prefetch(value, [t.value for t in src_list], loc=loc, ip=ip)

@@ -1,9 +1,9 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Use of this software is governed by the terms and conditions of the
 # NVIDIA End User License Agreement (EULA), available at:
-# https://docs.nvidia.com/cutlass/media/docs/pythonDSL/license.html
+# https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/license.html
 #
 # Any use, reproduction, disclosure, or distribution of this software
 # and related documentation outside the scope permitted by the EULA
@@ -11,21 +11,23 @@
 
 import enum
 from dataclasses import dataclass
-from typing import Type, Any
+from typing import Any, Optional, Type, Union, cast
+import warnings
 
-from cutlass import cute
 from cutlass.base_dsl.arch import Arch
-from cutlass.cutlass_dsl import CuTeDSL, T
+from cutlass.cutlass_dsl import BaseDSL, T, DSLRuntimeError
+from typing_extensions import deprecated
 
+from cutlass._mlir import ir
 import cutlass._mlir.dialects.cute as _cute_ir
 import cutlass._mlir.dialects.cute_nvgpu as _cute_nvgpu_ir
-from cutlass._mlir import ir
 
-from ..common import OpError
+from ..common import OpError, normalize_field_to_ir_name
+from ..common import OperandMajorMode as _OperandMajorMode
 from ...core import _pack_shape, rank, depth
-from ...tensor import _Tensor
 from ...typing import (
     Shape,
+    Tensor,
     Float16,
     BFloat16,
     Float32,
@@ -35,10 +37,11 @@ from ...typing import (
     Int32,
     Int8,
     Uint8,
+    Integer,
     Numeric,
     AddressSpace,
 )
-from ...atom import MmaOp, Trait
+from ...atom import MmaOp as AtomMmaOp, Trait, make_atom
 
 
 ####################################################################################################
@@ -48,7 +51,7 @@ from ...atom import MmaOp, Trait
 ####################################################################################################
 
 
-class WarpGroupMmaOp(MmaOp):
+class WarpGroupMmaOp(AtomMmaOp):
     """
     Base class for all warpgroup-level MMA operations.
     """
@@ -56,6 +59,9 @@ class WarpGroupMmaOp(MmaOp):
     pass
 
 
+@deprecated(
+    "warpgroup.OperandMajorMode is deprecated, use cute.nvgpu.OperandMajorMode instead"
+)
 class OperandMajorMode(enum.Enum):
     """
     An enumeration for the majorness of the input operands of the MMA.
@@ -70,14 +76,29 @@ class OperandMajorMode(enum.Enum):
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}.{self.name}>"
 
+    def __eq__(self, other: object) -> bool:
+        if hasattr(other, "_to_ir") and type(other._to_ir()) is type(self._to_ir()):
+            return self._to_ir() == other._to_ir()
+        raise DSLRuntimeError(
+            f"{self.__module__}.{self.__class__.__qualname__} cannot be compared with "
+            f"{getattr(other, '__module__', '?')}.{other.__class__.__qualname__}"
+        )
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash(self.value)
+
     @classmethod
-    def _missing_(cls, value):
+    def _missing_(cls, value: Any) -> Optional["OperandMajorMode"]:
         if isinstance(value, str):
             value = value.upper()
             if value == "MN":
                 return OperandMajorMode.MN
             elif value == "K":
                 return OperandMajorMode.K
+        return None
 
     def _to_ir(self) -> _cute_ir.MajorMode:
         return self.value
@@ -125,12 +146,12 @@ class MmaOp(WarpGroupMmaOp):
     acc_dtype: Type[Numeric]
     shape_mnk: Shape
     a_src: OperandSource
-    a_major_mode: OperandMajorMode
-    b_major_mode: OperandMajorMode
+    a_major_mode: Union[_OperandMajorMode, OperandMajorMode]
+    b_major_mode: Union[_OperandMajorMode, OperandMajorMode]
 
     def __post_init__(self) -> None:
         # Verify arch
-        arch = CuTeDSL._get_dsl().get_arch_enum()
+        arch = BaseDSL._get_dsl().get_arch_enum()
         if not arch == Arch.sm_90a:
             raise OpError(
                 self,
@@ -143,24 +164,46 @@ class MmaOp(WarpGroupMmaOp):
                 self,
                 "expects the 'a_src' Op parameter to be a warpgroup.OperandSource instance",
             )
-        if not isinstance(self.a_major_mode, OperandMajorMode):
+        if not isinstance(self.a_major_mode, _OperandMajorMode) and not isinstance(
+            self.a_major_mode, OperandMajorMode
+        ):
             raise OpError(
                 self,
-                "expects the 'a_major_mode' Op parameter to be a warpgroup.OperandMajorMode instance",
+                "expects the 'a_major_mode' Op parameter to be a cute.nvgpu.OperandMajorMode or warpgroup.OperandMajorMode (deprecated) instance",
             )
-        if not isinstance(self.b_major_mode, OperandMajorMode):
+        if not isinstance(self.b_major_mode, _OperandMajorMode) and not isinstance(
+            self.b_major_mode, OperandMajorMode
+        ):
             raise OpError(
                 self,
-                "expects the 'b_major_mode' Op parameter to be a warpgroup.OperandMajorMode instance",
+                "expects the 'b_major_mode' Op parameter to be a cute.nvgpu.OperandMajorMode or warpgroup.OperandMajorMode (deprecated) instance",
             )
+        if isinstance(self.a_major_mode, OperandMajorMode) or isinstance(
+            self.b_major_mode, OperandMajorMode
+        ):
+            warnings.warn(
+                "warpgroup.OperandMajorMode is deprecated, use cute.nvgpu.OperandMajorMode instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            # Normalize the major modes to the new enum type
+            # Since this is a frozen dataclass, we need to use the object.__setattr__ method to set the attributes
+            object.__setattr__(
+                self, "a_major_mode", _OperandMajorMode(self.a_major_mode.value)
+            )
+            object.__setattr__(
+                self, "b_major_mode", _OperandMajorMode(self.b_major_mode.value)
+            )
+
         # Verify instruction shape
-        if (rank(self.shape_mnk) not in [2, 3]) or (depth(self.shape_mnk) != 1):
+        shape_mnk_tuple: Any = cast(Any, self.shape_mnk)
+        if (rank(shape_mnk_tuple) not in [2, 3]) or (depth(shape_mnk_tuple) != 1):
             raise OpError(
                 self,
                 f"expected a flat rank 2 or 3 tuple for the 'shape_mnk' Op parameter, "
                 f"but got {self.shape_mnk}",
             )
-        m, n = self.shape_mnk[0], self.shape_mnk[1]
+        m, n = shape_mnk_tuple[0], shape_mnk_tuple[1]
         if m != 64:
             raise OpError(self, f"expects the M-mode to be 64, but got {m}")
         if (n < 8) or (n > 256) or (n % 8 != 0):
@@ -171,7 +214,7 @@ class MmaOp(WarpGroupMmaOp):
 
     def __str__(self) -> str:
         return (
-            self.__class__.descriptive_name  # type: ignore
+            self.__class__.descriptive_name
             + f"\n  A data type           = {self.a_dtype}"
             + f"\n  B data type           = {self.b_dtype}"
             + f"\n  Accumulator data type = {self.acc_dtype}"
@@ -181,7 +224,13 @@ class MmaOp(WarpGroupMmaOp):
             + f"\n  Instruction shape MNK = {self.shape_mnk}"
         )
 
-    def _verify_fragment_A(self, input: _Tensor, *, loc=None, ip=None):
+    def _verify_fragment_A(
+        self,
+        input: Tensor,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> bool:
         if input.memspace == AddressSpace.smem and isinstance(
             input.layout.type, _cute_ir.ComposedLayoutType
         ):
@@ -193,7 +242,13 @@ class MmaOp(WarpGroupMmaOp):
             )
         return True
 
-    def _verify_fragment_B(self, input: _Tensor, *, loc=None, ip=None):
+    def _verify_fragment_B(
+        self,
+        input: Tensor,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> bool:
         if input.memspace == AddressSpace.smem and isinstance(
             input.layout.type, _cute_ir.ComposedLayoutType
         ):
@@ -209,26 +264,43 @@ class MmaOp(WarpGroupMmaOp):
 class MmaTraits(Trait):
     admissible_fields = [Field.ACCUMULATE]
 
-    def set(self, field, value, *, loc=None, ip=None) -> None:
-        if field not in self.admissible_fields:
-            raise ValueError(
-                f"invalid field, must be {Field.ACCUMULATE}, but got {field}"
-            )
-        field_name = f"#cute_nvgpu.atom_mma_field_sm90<{field._to_ir_field_name()}>"
-        attr = ir.Attribute.parse(field_name)
+    def _normalize_field_name(self, field: Any) -> str:
+        """
+        Normalize a field specifier (enum or string) into the IR logical field name.
+        Accepted inputs:
+          - Field.ACCUMULATE
+          - "accum_c"
+        """
+        return normalize_field_to_ir_name(field, self.admissible_fields)
+
+    def set(
+        self,
+        field: Any,
+        field_value: Any,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> None:
+        field_ir_name = self._normalize_field_name(field)
+        bool_val = Boolean(field_value).ir_value(loc=loc, ip=ip)
+        trait_ir_val = self.value
+        attr = _cute_nvgpu_ir.resolve_atom_field_attr(trait_ir_val, field_ir_name)
         self.value = _cute_nvgpu_ir.atom_set_value(
-            self.value, attr, Boolean(value).ir_value(loc=loc, ip=ip), loc=loc, ip=ip
+            trait_ir_val, attr, bool_val, loc=loc, ip=ip
         )
 
-    def get(self, field, *, loc=None, ip=None) -> Any:
-        if field not in self.admissible_fields:
-            raise ValueError(
-                f"invalid field, must be {Field.ACCUMULATE}, but got {field}"
-            )
-        field_name = f"#cute_nvgpu.atom_mma_field_sm90<{field._to_ir_field_name()}>"
-        attr = ir.Attribute.parse(field_name)
+    def get(
+        self,
+        field: Any,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Any:
+        field_ir_name = self._normalize_field_name(field)
+        trait_ir_val = self.value
+        attr = _cute_nvgpu_ir.resolve_atom_field_attr(trait_ir_val, field_ir_name)
         return _cute_nvgpu_ir.atom_get_value(
-            Boolean.mlir_type, self.value, attr, loc=loc, ip=ip
+            Boolean.mlir_type, trait_ir_val, attr, loc=loc, ip=ip
         )
 
 
@@ -239,6 +311,44 @@ class MmaF16BF16Op(MmaOp):
 
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-instructions-wgmma-mma>`__.
     This Operation covers the instructions using the ``.f16`` or ``.bf16`` qualifiers for the input operands.
+
+    **Supported data type combinations:**
+
+    +-------------+-------------+----------+-------+
+    | A Data Type | B Data Type | Acc Type | Mma-K |
+    +=============+=============+==========+=======+
+    | F16         | F16         | F16, F32 | 16    |
+    +-------------+-------------+----------+-------+
+    | BF16        | BF16        | F32      | 16    |
+    +-------------+-------------+----------+-------+
+
+    **Supported architectures:** sm_90a
+
+    **Constraints:**
+
+    * Mma-M = 64
+    * 8 <= Mma-N <= 256, step 8
+    * A and B support both K-major and MN-major (transpose) when A is in shared memory (descriptor).
+      When A is in registers, only B can be transposed.
+
+    **Execution Model:**
+
+    * WGMMA is asynchronous and collective at warpgroup scope (4 contiguous warps).
+      In user code, ``cute.gemm(...)`` should be issued warpgroup-uniformly.
+    * Before issuing ``cute.gemm(...)``, call ``cute.nvgpu.warpgroup.fence()`` to order
+      prior register writes to accumulator/A fragments with subsequent WGMMA reads.
+    * After issuing ``cute.gemm(...)``, call ``cute.nvgpu.warpgroup.commit_group()``.
+      Use ``cute.nvgpu.warpgroup.wait_group(N)`` before consuming or reusing accumulator
+      values from pending WGMMA groups.
+
+    .. code-block:: python
+
+        cute.nvgpu.warpgroup.fence()
+        cute.gemm(tiled_mma, acc, tCrA[tile_crd], tCrB[tile_crd], acc)
+        cute.nvgpu.warpgroup.commit_group()
+        cute.nvgpu.warpgroup.wait_group(1)
+        # ... pipeline continues ...
+        cute.nvgpu.warpgroup.wait_group(0)
     """
 
     descriptive_name = "warpgroup F16/BF16 MMA Operation"
@@ -249,8 +359,8 @@ class MmaF16BF16Op(MmaOp):
         acc_dtype: Type[Numeric],
         instruction_shape: Shape,
         a_src: OperandSource,
-        a_major_mode: OperandMajorMode,
-        b_major_mode: OperandMajorMode,
+        a_major_mode: Union[_OperandMajorMode, OperandMajorMode],
+        b_major_mode: Union[_OperandMajorMode, OperandMajorMode],
     ) -> None:
         super().__init__(
             ab_dtype,
@@ -284,16 +394,24 @@ class MmaF16BF16Op(MmaOp):
             )
         # Verify the instruction shape
         instruction_k = 16
-        if rank(self.shape_mnk) == 2:
-            object.__setattr__(self, "shape_mnk", (*self.shape_mnk, instruction_k))
-        if self.shape_mnk[2] != instruction_k:
+        shape_mnk_tuple: Any = cast(Any, self.shape_mnk)
+        if rank(shape_mnk_tuple) == 2:
+            object.__setattr__(self, "shape_mnk", (*shape_mnk_tuple, instruction_k))
+            shape_mnk_tuple = cast(Any, self.shape_mnk)
+        if shape_mnk_tuple[2] != instruction_k:
             raise OpError(
                 self,
                 f"expects the instruction extent in the K-mode to be {instruction_k}, "
-                f"but got {self.shape_mnk[2]}",
+                f"but got {shape_mnk_tuple[2]}",
             )
 
-    def _make_trait(self, *, loc=None, ip=None, **kwargs) -> "MmaF16BF16Trait":
+    def _make_trait(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
+    ) -> "MmaF16BF16Trait":
         shape_mnk = _pack_shape(self.shape_mnk, loc=loc, ip=ip)
         ty = _cute_nvgpu_ir.MmaAtomSM90Type.get(
             shape_mnk.type.attribute,
@@ -305,12 +423,7 @@ class MmaF16BF16Op(MmaOp):
             self.a_src._to_ir(),
         )
         return MmaF16BF16Trait(
-            cute.make_atom(
-                ty,
-                (Boolean(False).ir_value(loc=loc, ip=ip),),
-                loc=loc,
-                ip=ip,
-            )
+            make_atom(ty, [Boolean(False).ir_value(loc=loc, ip=ip)], loc=loc, ip=ip)
         )
 
 
@@ -321,10 +434,46 @@ class MmaF16BF16Trait(MmaTraits):
 @dataclass(frozen=True)
 class MmaF8Op(MmaOp):
     """
-    F16/BF16 warpgroup MMA Operation.
+    F8 warpgroup MMA Operation.
 
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-instructions-wgmma-mma>`__.
     This Operation covers the instructions using the ``.e4m3`` or ``.e5m2`` qualifiers for the input operands.
+
+    **Supported data type combinations:**
+
+    +-------------+-------------+----------+-------+
+    | A Data Type | B Data Type | Acc Type | Mma-K |
+    +=============+=============+==========+=======+
+    | E4M3, E5M2  | E4M3, E5M2  | F16, F32 | 32    |
+    +-------------+-------------+----------+-------+
+
+    **Supported architectures:** sm_90a
+
+    **Constraints:**
+
+    * Mma-M = 64
+    * 8 <= Mma-N <= 256, step 8
+    * A and B data types are independent (mixed FP8 allowed)
+    * Transpose (MN-major) is not supported for A or B. Both operands must be K-major.
+
+    **Execution Model:**
+
+    * WGMMA is asynchronous and collective at warpgroup scope (4 contiguous warps).
+      In user code, ``cute.gemm(...)`` should be issued warpgroup-uniformly.
+    * Before issuing ``cute.gemm(...)``, call ``cute.nvgpu.warpgroup.fence()`` to order
+      prior register writes to accumulator/A fragments with subsequent WGMMA reads.
+    * After issuing ``cute.gemm(...)``, call ``cute.nvgpu.warpgroup.commit_group()``.
+      Use ``cute.nvgpu.warpgroup.wait_group(N)`` before consuming or reusing accumulator
+      values from pending WGMMA groups.
+
+    .. code-block:: python
+
+        cute.nvgpu.warpgroup.fence()
+        cute.gemm(tiled_mma, acc, tCrA[tile_crd], tCrB[tile_crd], acc)
+        cute.nvgpu.warpgroup.commit_group()
+        cute.nvgpu.warpgroup.wait_group(1)
+        # ... pipeline continues ...
+        cute.nvgpu.warpgroup.wait_group(0)
     """
 
     descriptive_name = "warpgroup F8 MMA Operation"
@@ -336,8 +485,8 @@ class MmaF8Op(MmaOp):
         acc_dtype: Type[Numeric],
         instruction_shape: Shape,
         a_src: OperandSource,
-        a_major_mode: OperandMajorMode,
-        b_major_mode: OperandMajorMode,
+        a_major_mode: Union[_OperandMajorMode, OperandMajorMode],
+        b_major_mode: Union[_OperandMajorMode, OperandMajorMode],
     ) -> None:
         super().__init__(
             a_dtype,
@@ -350,7 +499,7 @@ class MmaF8Op(MmaOp):
         )
         self._verify()
 
-    def _verify(self):
+    def _verify(self) -> None:
         # Input data type verification
         if self.a_dtype not in [Float8E5M2, Float8E4M3FN]:
             raise OpError(
@@ -370,16 +519,24 @@ class MmaF8Op(MmaOp):
             )
         # Verify the instruction shape
         instruction_k = 32
-        if rank(self.shape_mnk) == 2:
-            object.__setattr__(self, "shape_mnk", (*self.shape_mnk, instruction_k))
-        if self.shape_mnk[2] != instruction_k:
+        shape_mnk_tuple: Any = cast(Any, self.shape_mnk)
+        if rank(shape_mnk_tuple) == 2:
+            object.__setattr__(self, "shape_mnk", (*shape_mnk_tuple, instruction_k))
+            shape_mnk_tuple = cast(Any, self.shape_mnk)
+        if shape_mnk_tuple[2] != instruction_k:
             raise OpError(
                 self,
                 f"expects the instruction extent in the K-mode to be {instruction_k}, "
-                f"but got {self.shape_mnk[2]}",
+                f"but got {shape_mnk_tuple[2]}",
             )
 
-    def _make_trait(self, *, loc=None, ip=None, **kwargs) -> "MmaF8Trait":
+    def _make_trait(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
+    ) -> "MmaF8Trait":
         shape_mnk = _pack_shape(self.shape_mnk, loc=loc, ip=ip)
         ty = _cute_nvgpu_ir.MmaAtomSM90Type.get(
             shape_mnk.type.attribute,
@@ -391,12 +548,7 @@ class MmaF8Op(MmaOp):
             self.a_src._to_ir(),
         )
         return MmaF8Trait(
-            cute.make_atom(
-                ty,
-                (Boolean(False).ir_value(loc=loc, ip=ip),),
-                loc=loc,
-                ip=ip,
-            )
+            make_atom(ty, [Boolean(False).ir_value(loc=loc, ip=ip)], loc=loc, ip=ip)
         )
 
 
@@ -411,6 +563,42 @@ class MmaI8Op(MmaOp):
 
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-instructions-wgmma-mma>`__.
     This Operation covers the instructions using the ``.s8`` or ``.u8`` qualifiers for the input operands.
+
+    **Supported data type combinations:**
+
+    +-------------+-------------+----------+-------+
+    | A Data Type | B Data Type | Acc Type | Mma-K |
+    +=============+=============+==========+=======+
+    | Int8, Uint8 | Int8, Uint8 | Int32    | 32    |
+    +-------------+-------------+----------+-------+
+
+    **Supported architectures:** sm_90a
+
+    **Constraints:**
+
+    * Mma-M = 64
+    * Mma-N in {8, 24} or Mma-N % 16 == 0, with 8 <= Mma-N <= 256
+    * A and B signedness are independent (mixed signed/unsigned allowed)
+    * Transpose (MN-major) is not supported for A or B. Both operands must be K-major.
+
+    **Execution Model:**
+
+    * WGMMA is asynchronous and collective at warpgroup scope (4 contiguous warps).
+      In user code, ``cute.gemm(...)`` should be issued warpgroup-uniformly.
+    * Before issuing ``cute.gemm(...)``, call ``cute.nvgpu.warpgroup.fence()`` to order
+      prior register writes to accumulator/A fragments with subsequent WGMMA reads.
+    * After issuing ``cute.gemm(...)``, call ``cute.nvgpu.warpgroup.commit_group()``.
+      Use ``cute.nvgpu.warpgroup.wait_group(N)`` before consuming or reusing accumulator
+      values from pending WGMMA groups.
+
+    .. code-block:: python
+
+        cute.nvgpu.warpgroup.fence()
+        cute.gemm(tiled_mma, acc, tCrA[tile_crd], tCrB[tile_crd], acc)
+        cute.nvgpu.warpgroup.commit_group()
+        cute.nvgpu.warpgroup.wait_group(1)
+        # ... pipeline continues ...
+        cute.nvgpu.warpgroup.wait_group(0)
     """
 
     descriptive_name = "warpgroup I8 MMA Operation"
@@ -422,8 +610,8 @@ class MmaI8Op(MmaOp):
         acc_dtype: Type[Numeric],
         instruction_shape: Shape,
         a_src: OperandSource,
-        a_major_mode: OperandMajorMode,
-        b_major_mode: OperandMajorMode,
+        a_major_mode: Union[_OperandMajorMode, OperandMajorMode],
+        b_major_mode: Union[_OperandMajorMode, OperandMajorMode],
     ) -> None:
         super().__init__(
             a_dtype,
@@ -436,7 +624,7 @@ class MmaI8Op(MmaOp):
         )
         self._verify()
 
-    def _verify(self):
+    def _verify(self) -> None:
         # Input data type verification
         if self.a_dtype not in [Int8, Uint8]:
             raise OpError(
@@ -457,16 +645,18 @@ class MmaI8Op(MmaOp):
 
         # Verify the instruction shape
         instruction_k = 32
-        if rank(self.shape_mnk) == 2:
-            object.__setattr__(self, "shape_mnk", (*self.shape_mnk, instruction_k))
-        if self.shape_mnk[2] != instruction_k:
+        shape_mnk_tuple: Any = cast(Any, self.shape_mnk)
+        if rank(shape_mnk_tuple) == 2:
+            object.__setattr__(self, "shape_mnk", (*shape_mnk_tuple, instruction_k))
+            shape_mnk_tuple = cast(Any, self.shape_mnk)
+        if shape_mnk_tuple[2] != instruction_k:
             raise OpError(
                 self,
                 f"expects the instruction extent in the K-mode to be {instruction_k}, "
-                f"but got {self.shape_mnk[2]}",
+                f"but got {shape_mnk_tuple[2]}",
             )
 
-        n = self.shape_mnk[1]
+        n = shape_mnk_tuple[1]
         if not (n >= 8 and n <= 256 and (n == 8 or n == 24 or n % 16 == 0)):
             raise OpError(
                 self,
@@ -474,8 +664,16 @@ class MmaI8Op(MmaOp):
                 f"or N=16*i where i={{3,4,...,15,16}}. But got {n}",
             )
 
-    def _make_trait(self, *, loc=None, ip=None, **kwargs) -> "MmaI8Trait":
+    def _make_trait(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
+    ) -> "MmaI8Trait":
         shape_mnk = _pack_shape(self.shape_mnk, loc=loc, ip=ip)
+        # MmaI8 only operates on integer dtypes.
+        assert issubclass(self.a_dtype, Integer) and issubclass(self.b_dtype, Integer)
         ty = _cute_nvgpu_ir.MmaAtomSM90Type.get(
             shape_mnk.type.attribute,
             self.a_major_mode._to_ir(),
@@ -486,12 +684,7 @@ class MmaI8Op(MmaOp):
             self.a_src._to_ir(),
         )
         return MmaI8Trait(
-            cute.make_atom(
-                ty,
-                (Boolean(False).ir_value(loc=loc, ip=ip),),
-                loc=loc,
-                ip=ip,
-            )
+            make_atom(ty, [Boolean(False).ir_value(loc=loc, ip=ip)], loc=loc, ip=ip)
         )
 
 

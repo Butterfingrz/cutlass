@@ -79,6 +79,12 @@ by reducing register usage and the number of address calculation instructions. W
 to True, a runtime check is performed to ensure that the layout does not overflow. Please note that this parameter
 only has an effect when the tensor's layout is marked as dynamic.
 
+For packed subbyte torch dtypes such as ``torch.float4_e2m1fn_x2``, ``from_dlpack`` exposes the
+logical element layout expected by CuTe instead of the packed storage layout. For example, a torch
+tensor with shape ``(128, 128)`` and dtype ``torch.float4_e2m1fn_x2`` is exposed as a logical FP4
+tensor with shape ``(128, 256)``. The same logical reinterpretation also applies when the leading
+dimension is not the last mode.
+
 Code Example
 ~~~~~~~~~~~~
 
@@ -175,22 +181,26 @@ stride is set to 1 unless inconsistent with the layout of the DLPack tensor. For
 The default value for ``leading_dim`` is ``None``.  In such case, the system
 automatically deduces it from the tensor's layout using the following logic:
 
-1. If a dimension's stride is 1, that dimension is marked as the leading dimension.
-2. If multiple dimensions satisfy condition 1, an error is thrown indicating deduction failure.
+1. If exactly one dimension has stride 1, that dimension is the leading dimension.
+2. If multiple dimensions have stride 1, deduction succeeds only when exactly one of them
+   has size > 1 (that dimension is used). If none or more than one has size > 1, an error is raised.
    Note that after converting a **PyTorch** tensor to the DLPack format, the stride for dimensions
-   with size 1 are canonicalized to 1. This canonicalization can increase the likelihood of
-   deduction failures. This behavior is specific to PyTorch and does not occur with NumPy for
-   example.
-3. If no dimension satisfies condition 1, all strides are marked as dynamic.
+   with size 1 are canonicalized to 1, which can produce multiple stride-1 dimensions.
+3. If no dimension has stride 1, all strides remain dynamic.
 
 For example:
 
 - For a tensor with layout ``(2,2,3,4):(2,1,4,12)``, the leading dimension is 1.
   The layout will be marked as ``(?,?,?,?):(?,1,?,?)``.
-- For a tensor with layout ``(1,5,1):(1,1,1)``, if ``leading_dim`` is not specified,
-  a deduction failure error is raised.
-- For a tensor with layout ``(2,2):(8,2)``, since no dimension has stride 1,
-  all dimensions are marked as dynamic: ``(?,?):(?,?)``.
+- For a tensor with layout ``(1,5,1):(1,1,1)``, multiple dimensions have stride 1 but exactly one
+  has size > 1 (dim 1). The leading dimension is deduced to be 1: ``(?,?,?):(?,1,?)``.
+- For a tensor with layout ``(2,2):(8,2)``, no dimension has stride 1, so all strides remain
+  dynamic: ``(?,?):(?,?)``.
+
+The leading dimension accepts negative index which means the dimension is counted from the last dimension. For example,
+
+- For a tensor with layout ``(2,2,3,4):(2,1,4,12)``, if ``leading_dim`` is specified to be -1,
+  the layout will be marked as ``(?,?,?,?):(?,?,?,1)``.
 
 Code Example
 ~~~~~~~~~~~~
@@ -201,8 +211,9 @@ The following example demonstrates how to use ``mark_layout_dynamic`` to specify
 * ``t1`` & ``t2`` shows the usage of ``mark_layout_dynamic`` with specified ``leading_dim``.
 * ``t3`` shows the usage of ``mark_layout_dynamic`` with no leading dimension.
 * ``t4`` shows the usage of ``mark_layout_dynamic`` with broadcasted dimensions.
-* ``t5`` demonstrates the deduction failure when the there're more than one dimensions with stride equals to 1.
-* ``t6`` & ``t7`` demonstrates incorrect settings for ``leading_dim`` and expected errors.
+* ``t5`` shows automatic deduction for tensor ``b`` (multiple stride-1, exactly one has size > 1 → dim 1).
+* ``t5_fail`` demonstrates the deduction failure when multiple dimensions have stride 1 but none has size > 1.
+* ``t6`` & ``t7`` demonstrate incorrect settings for ``leading_dim`` and expected errors.
 
 .. code-block:: python
 
@@ -240,8 +251,14 @@ The following example demonstrates how to use ``mark_layout_dynamic`` to specify
     print(t4)
     # (?,?,?,?):(?,0,0,1)
 
+    # b has layout (1,4,1,32,1):(1,1,1,4,1); dim 1 has size > 1, so deduction succeeds to dim 1.
     t5 = from_dlpack(b).mark_layout_dynamic()
-    # Can't decude the leading dimension from layout, please specify the leading_dim explicitly.
+    print(t5)
+    # (?,?,?,?,?):(?{i64},1,?{i64},?{i64},?{i64})
+
+    # Rejected: multiple stride-1, none with size > 1 (e.g. torch.ones(1,1,1)).
+    t5_fail = from_dlpack(torch.ones(1, 1, 1)).mark_layout_dynamic()
+    # Can't deduce the leading dimension from layout (multiple dimensions have stride 1 but none has size > 1)...
 
     t6 = from_dlpack(a).mark_layout_dynamic(leading_dim=1)
     # Expected strides[leading_dim] == 1, but got 16
@@ -415,24 +432,36 @@ The following example demonstrates how to use ``mark_compact_shape_dynamic`` to 
     )
     # Layout in DLTensorWrapper has int32 overflow risk. Please set use_32bit_stride to False.
 
+Leveraging TVM FFI for Faster PyTorch Interop
+---------------------------------------------
+
+The latest version of |DSL| supports TVM FFI to improve interoperability with PyTorch
+and other machine learning frameworks. Using TVM FFI provides the following features:
+
+- Faster JIT function invocation.
+- Direct acceptance of ``torch.Tensor`` objects as function arguments.
+- Enhanced error handling and kernel validation.
+- Seamless integration with multiple programming languages.
+
+For more details, see :doc:`compile_with_tvm_ffi`.
 
 Bypass the DLPack Protocol
 --------------------------
 
-In certain scenarios, users may wish to bypass the DLPack protocol and invoke the JIT function directly.  
-This can be accomplished by creating a lightweight JIT wrapper around the existing JIT function, 
+In certain scenarios, users may wish to bypass the DLPack protocol and invoke the JIT function directly.
+This can be accomplished by creating a lightweight JIT wrapper around the existing JIT function,
 utilizing ``cute.ptr`` and ``cute.make_tensor`` to pass pointers and construct tensors directly.
 
 Typical use cases for bypassing DLPack include:
 1. Users want to call the JIT function directly to avoid the overhead introduced by the DLPack protocol.
-2. DLPack canonicalizes the stride of shape-1 dimensions to 1, which may result in incorrect alignment 
+2. DLPack canonicalizes the stride of shape-1 dimensions to 1, which may result in incorrect alignment
 propagation and affect memory access or performance.
 3. DLPack may lack support for some narrow data types.
 
 The following example illustrates how to bypass the DLPack protocol when invoking a JIT function.
-Assume we have a pre-defined ``TensorOpGemm`` kernel whose JIT interface expects three 
-arguments of type ``cute.Tensor``. To enable direct invocation without DLPack, we first define a JIT wrapper 
-function that accepts ``cute.Pointer`` types as parameters. Within this wrapper, we use ``cute.make_tensor`` 
+Assume we have a pre-defined ``TensorOpGemm`` kernel whose JIT interface expects three
+arguments of type ``cute.Tensor``. To enable direct invocation without DLPack, we first define a JIT wrapper
+function that accepts ``cute.Pointer`` types as parameters. Within this wrapper, we use ``cute.make_tensor``
 to construct tensors from the provided pointers, and then call the ``TensorOpGemm`` kernel as usual.
 
 .. code-block:: python
@@ -459,7 +488,7 @@ to construct tensors from the provided pointers, and then call the ``TensorOpGem
         mA = cute.make_tensor(a_ptr, layout=a_layout)
         mB = cute.make_tensor(b_ptr, layout=b_layout)
         mC = cute.make_tensor(c_ptr, layout=c_layout)
-        
+
         # TensorOpGemm is a pre-defined kernel from our example
         tensor_op_gemm = TensorOpGemm(
             a_ptr.value_type, c_ptr.value_type, cutlass.Float32, (2, 2, 1)
@@ -467,9 +496,9 @@ to construct tensors from the provided pointers, and then call the ``TensorOpGem
 
         tensor_op_gemm(mA, mB, mC)
 
-To pass a PyTorch tensor to this new JIT wrapper, we retrieve the raw pointer from the PyTorch tensor 
+To pass a PyTorch tensor to this new JIT wrapper, we retrieve the raw pointer from the PyTorch tensor
 and create a ``cute.Pointer`` instance using ``cute.make_ptr``.
-This approach allows us to bypass the DLPack protocol entirely, avoiding its overhead and potential 
+This approach allows us to bypass the DLPack protocol entirely, avoiding its overhead and potential
 issues with shape-1 dimension handling.
 
 .. code-block:: python
@@ -483,15 +512,16 @@ issues with shape-1 dimension handling.
     c = torch.randn(
         n, m, l, dtype=torch.float16, device="cuda"
     ).permute(1, 2, 0)
-    
+
     # from cutlass.cute.runtime import make_ptr
     a_ptr = make_ptr(
-        cutlass.Float16, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+        cutlass.Float16, a.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
     )
     b_ptr = make_ptr(
-        cutlass.Float16, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+        cutlass.Float16, b.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
     )
     c_ptr = make_ptr(
-        cutlass.Float16, c.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+        cutlass.Float16, c.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
     )
     tensor_op_gemm_wrapper(a_ptr, b_ptr, c_ptr, m, n, k, l)
+

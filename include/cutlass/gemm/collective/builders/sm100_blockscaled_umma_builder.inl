@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -73,7 +73,7 @@ sm100_compute_stage_count_or_override_blockscaled(StageCountAutoCarveout<carveou
   // 1. smem for A and smem for B (CollectiveMma::SharedStorage::TensorStorage)
   // 2. one MainloopPipeline = PipelineTmaUmmaAsync (CollectiveMma::SharedStorage::SharedStorage)
   // 3. smem for SFB and smem for SFB (CollectiveMma::SharedStorage::TensorStorage, independent of input size b.c. sizeof(sf) is fixed)
-  constexpr auto mainloop_pipeline_bytes = sizeof(typename cutlass::PipelineTmaUmmaAsync<1>::SharedStorage);
+  constexpr auto mainloop_pipeline_bytes = cutlass::round_up(sizeof(typename cutlass::PipelineTmaUmmaAsync<1>::SharedStorage), 128);
   constexpr auto a_bits = cute::sizeof_bits_v<ElementA>;
   constexpr auto b_bits = cute::sizeof_bits_v<ElementB>;
   constexpr auto stage_sfa_bytes = size(filter_zeros(TileShapeSFA{}));
@@ -124,6 +124,7 @@ struct CollectiveBuilder<
       ) &&
       // Blockscaled Gemm
       (not cute::is_same_v<KernelMixedTmaCpAsyncWarpSpecialized1SmBlockScaledSm100, BuilderScheduleTag>) &&
+      (not cute::is_same_v<KernelMixedTmaCpAsyncWarpSpecialized2SmBlockScaledSm100, BuilderScheduleTag>) &&
       (cute::is_base_of_v<KernelScheduleBlockScaledGemmSm100, BuilderScheduleTag> ||
        cute::is_same_v<KernelScheduleAuto, BuilderScheduleTag>) 
        &&
@@ -241,8 +242,9 @@ struct CollectiveBuilder<
   static constexpr uint32_t AccumulatorPipelineStageCount = (MMA_N == 256) ? 1 : 2;
   static constexpr bool IsArrayOfPointersGemm = cute::is_base_of_v<KernelSchedulePtrArrayBlockScaledGemmSm100, BuilderScheduleTag>;
   // Grouped GEMM(where Stride type is Stride*) uses specific static tile scheduler.  
-  static constexpr bool IsGroupGemm = !cute::is_same_v<StrideA, InternalStrideA>;
-  static constexpr uint32_t SchedulerPipelineStageCount = cute::conditional_return<IsGroupGemm>(8, 2);
+  static constexpr bool IsGroupGemm = !(cute::is_same_v<StrideA, InternalStrideA>) && !(cute::is_same_v<StrideB, InternalStrideB>);
+  static constexpr bool IsRCGroupGemm = (cute::is_same_v<StrideA, InternalStrideA>) && !(cute::is_same_v<StrideB, InternalStrideB>);
+  static constexpr uint32_t SchedulerPipelineStageCount = cute::conditional_return<IsGroupGemm || IsRCGroupGemm>(8, 2);
 
   static constexpr uint32_t KernelSmemCarveout = detail::Sm100DenseGemmTmaUmmaCarveout<
       ClusterShape_MNK,
@@ -254,8 +256,7 @@ struct CollectiveBuilder<
     >::KernelSmemCarveout;
   // Reduce SMEM capacity available for buffers considering barrier allocations.
   
-  static constexpr int ReducedSmemCapacityBytes = 
-    cutlass::gemm::collective::detail::sm100_smem_capacity_bytes - KernelSmemCarveout;
+  static constexpr int ReducedSmemCapacityBytes = detail::sm100_reduced_smem_capacity_bytes<ArchTag, KernelSmemCarveout>();
 
   using SmemTileShape = cute::Shape<BlockTileA_M, BlockTileB_N, BlockTileA_K>;
 
@@ -265,17 +266,28 @@ struct CollectiveBuilder<
 
   using DispatchPolicy = 
     cute::conditional_t<IsArrayOfPointersGemm,
-      cutlass::gemm::MainloopSm100ArrayTmaUmmaWarpSpecializedBlockScaled<
+        cute::conditional_t<IsRCGroupGemm, 
+          cutlass::gemm::MainloopSm100RCGroupGemmTmaUmmaWarpSpecializedBlockScaled<
+            PipelineStages,
+            SchedulerPipelineStageCount,
+            AccumulatorPipelineStageCount,
+            ClusterShape_MNK,
+            ArchTag
+          >,
+          cutlass::gemm::MainloopSm100ArrayTmaUmmaWarpSpecializedBlockScaled<
+            PipelineStages,
+            SchedulerPipelineStageCount,
+            AccumulatorPipelineStageCount,
+            ClusterShape_MNK,
+            ArchTag
+          >
+        >,
+        cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaled<
           PipelineStages,
           SchedulerPipelineStageCount,
           AccumulatorPipelineStageCount,
-          ClusterShape_MNK
-      >,
-      cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaled<
-          PipelineStages,
-          SchedulerPipelineStageCount,
-          AccumulatorPipelineStageCount,
-          ClusterShape_MNK
+          ClusterShape_MNK,
+          ArchTag
       >
     >;
 

@@ -1,9 +1,9 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Use of this software is governed by the terms and conditions of the
 # NVIDIA End User License Agreement (EULA), available at:
-# https://docs.nvidia.com/cutlass/media/docs/pythonDSL/license.html
+# https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/license.html
 #
 # Any use, reproduction, disclosure, or distribution of this software
 # and related documentation outside the scope permitted by the EULA
@@ -23,11 +23,13 @@ import os
 import sys
 import shutil
 import glob
+import warnings
 from pathlib import Path
 from functools import lru_cache
-from typing import Any
 
 from ..base_dsl.runtime.cuda import get_compute_capability_major_minor
+from .common import DSLUserCodeError
+from .diagnostics import DiagId
 from .utils.logger import log
 from .cache_helpers import get_default_file_dump_root
 
@@ -35,12 +37,64 @@ IS_WINDOWS = sys.platform == "win32"
 CLIB_EXT = ".dll" if IS_WINDOWS else ".so"
 
 # =============================================================================
+# [DSL]_KEEP token definitions
+# =============================================================================
+
+# All individual artifact tokens accepted by [DSL]_KEEP.
+_KEEP_ALL_TOKENS: frozenset[str] = frozenset(
+    {
+        "ir",
+        "ir-debug",
+        "ptx",
+        "cubin",
+        "sass",
+    }
+)
+# "all" is a convenience alias that expands to every token above.
+_KEEP_VALID_TOKENS: frozenset[str] = _KEEP_ALL_TOKENS | {"all"}
+
+CUTLASS_FAMILY_DSL_PREFIXES: frozenset[str] = frozenset(
+    {
+        "CUTE_DSL",
+        "CUTE_EXPERIMENTAL_DSL",
+    }
+)
+
+
+def is_cutlass_family_dsl_prefix(prefix: str) -> bool:
+    """Return whether the prefix uses the shared CuTe DSL runtime."""
+    return prefix in CUTLASS_FAMILY_DSL_PREFIXES
+
+
+def _parse_keep_tokens(raw: str, prefix: str = "") -> frozenset[str]:
+    """
+    Parse the value of [DSL]_KEEP into a frozenset of canonical artifact tokens.
+
+    Accepts a comma-separated list of tokens (case-insensitive).
+    The special value ``all`` expands to every token in ``_KEEP_ALL_TOKENS``.
+    Unknown tokens are logged as warnings and ignored.
+
+    Token semantics:
+      ir               — IR after canonicalize+cse (clean, human-readable)
+      ir-debug         — Raw IR before any passes (old KEEP_IR=1 behaviour)
+      ptx              — PTX assembly
+      cubin            — CUBIN binary
+      sass             — SASS disassembly
+    """
+    tokens = frozenset(t.strip().lower() for t in raw.split(",") if t.strip())
+    if "all" in tokens:
+        return _KEEP_ALL_TOKENS
+    unknown = tokens - _KEEP_VALID_TOKENS
+    return tokens - unknown
+
+
+# =============================================================================
 # Environment Variable Helpers
 # =============================================================================
 
 
 @lru_cache(maxsize=None)
-def get_str_env_var(var_name, default_value=None):
+def get_str_env_var(var_name: str, default_value: str | None = None) -> str | None:
     """
     Get the string value of an environment variable.
     Note that the value is cached after the first call.
@@ -49,32 +103,117 @@ def get_str_env_var(var_name, default_value=None):
     return value if value is not None else default_value
 
 
+_BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+
 @lru_cache(maxsize=None)
-def get_bool_env_var(var_name, default_value=False):
+def get_bool_env_var(var_name: str, default_value: bool = False) -> bool:
     """
     Get the value of a boolean environment variable.
-    If the value it not in False, 0, or empty string, it is considered True.
-    Note that the value is cached after the first call.
+
+    Recognized values (case-insensitive, surrounding whitespace ignored):
+      * Truthy:   ``1``, ``true``, ``yes``, ``on``
+      * Falsy:    ``0``, ``false``, ``no``, ``off``
+
+    An unset variable, or one whose value is empty (or whitespace only),
+    returns ``default_value``.
+
+    The parsed value is cached after the first call (per ``var_name`` /
+    ``default_value`` pair).
+
+    Raises:
+        ValueError: if the variable is set to any other value.
     """
-    value = get_str_env_var(var_name)
-    if value is None:
+    raw = get_str_env_var(var_name)
+    if raw is None:
         return default_value
-    return value not in {"False", "0", ""}
+    normalized = raw.strip().lower()
+    if normalized == "":
+        return default_value
+    if normalized in _BOOL_TRUE_VALUES:
+        return True
+    if normalized in _BOOL_FALSE_VALUES:
+        return False
+    raise ValueError(
+        f"Invalid value for environment variable {var_name}={raw!r}. "
+        f"Expected a boolean (case-insensitive): "
+        f"{sorted(_BOOL_TRUE_VALUES) + sorted(_BOOL_FALSE_VALUES)} "
+        f"or empty/unset to use the default ({default_value!r})."
+    )
 
 
 @lru_cache(maxsize=None)
-def get_int_env_var(var_name, default_value=0):
+def get_int_env_var(var_name: str, default_value: int = 0) -> int:
     """
     Get the value of an integer environment variable.
-    If the value is not a valid integer, the default value 0 is returned.
-    Note that the value is cached after the first call.
+
+    Surrounding whitespace is ignored. An unset variable or one with an
+    empty value returns ``default_value``. Negative integers (e.g.
+    ``-5``) are accepted.
+
+    Raises:
+        ValueError: if the variable is set to a value that is not a
+            valid base-10 integer.
+
+    The parsed value is cached after the first call (per ``var_name`` /
+    ``default_value`` pair).
     """
-    value = get_str_env_var(var_name)
-    return int(value) if value and value.isdigit() else default_value
+    raw = get_str_env_var(var_name)
+    if raw is None:
+        return default_value
+    stripped = raw.strip()
+    if stripped == "":
+        return default_value
+    try:
+        return int(stripped)
+    except ValueError:
+        raise ValueError(
+            f"Invalid value for environment variable {var_name}={raw!r}. "
+            f"Expected a base-10 integer, or empty/unset to use the "
+            f"default ({default_value!r})."
+        ) from None
 
 
 @lru_cache(maxsize=None)
-def has_env_var(var_name):
+def get_int_or_none_env_var(
+    var_name: str, default_value: int | None = None
+) -> int | None:
+    """
+    Get the value of an integer-or-``None`` environment variable.
+
+    Recognized values (case-insensitive, surrounding whitespace ignored):
+      * ``"none"``                       returns ``None``
+      * any base-10 integer literal      returns that integer (negatives accepted)
+
+    An unset variable or one with an empty value returns ``default_value``.
+
+    Raises:
+        ValueError: if the variable is set to anything else.
+
+    The parsed value is cached after the first call (per ``var_name`` /
+    ``default_value`` pair).
+    """
+    raw = get_str_env_var(var_name)
+    if raw is None:
+        return default_value
+    normalized = raw.strip().lower()
+    if normalized == "":
+        return default_value
+    if normalized == "none":
+        return None
+    try:
+        return int(normalized)
+    except ValueError:
+        raise ValueError(
+            f"Invalid value for environment variable {var_name}={raw!r}. "
+            f"Expected a base-10 integer, the literal 'none', or "
+            f"empty/unset to use the default ({default_value!r})."
+        ) from None
+
+
+@lru_cache(maxsize=None)
+def has_env_var(var_name: str) -> bool:
     """
     Check if an environment variable is set.
     Note that the value is cached after the first call.
@@ -82,7 +221,7 @@ def has_env_var(var_name):
     return os.getenv(var_name) is not None
 
 
-def detect_gpu_arch(prefix):
+def detect_gpu_arch(prefix: str) -> str:
     """
     Attempts to detect the machine's GPU architecture.
 
@@ -90,27 +229,28 @@ def detect_gpu_arch(prefix):
         A string representing the GPU architecture (e.g. "70" for compute capability 7.0),
         or a default value(e.g. "sm_100") if the GPU architecture cannot be determined.
     """
-    arch = (None, None)
+    arch: tuple[int | None, int | None] = (None, None)
     try:
         arch = get_compute_capability_major_minor()
     except Exception as e:
-        log().info(f"Failed to get CUDA compute capability: {e}")
+        log().info("Failed to get CUDA compute capability: %s", e)
 
     if arch == (None, None):
         # default to sm_100
         arch = (10, 0)
 
     major, minor = arch
+    assert major is not None and minor is not None
     suffix = ""
     if major >= 9:
         suffix = "a"
-    if major == 11 and minor == 0:
-        major, minor = 10, 1
 
     return f"sm_{major}{minor}{suffix}"
 
 
-def find_libs_in_ancestors(start, target_libs, lib_folder_guesses):
+def find_libs_in_ancestors(
+    start: str | Path, target_libs: set[str], lib_folder_guesses: list[str]
+) -> list[str] | None:
     """
     Search ancestor directories for a candidate library folder containing all required libraries.
 
@@ -162,7 +302,7 @@ def find_libs_in_ancestors(start, target_libs, lib_folder_guesses):
     return None
 
 
-def _find_cuda_home():
+def _find_cuda_home() -> str | None:
     """Find the CUDA installation path using a series of heuristic methods.
     Methods below are checked in order, and the function returns on first match:
     1. Checking the environment variables CUDA_HOME and CUDA_PATH.
@@ -202,27 +342,80 @@ def _find_cuda_home():
     return cuda_home
 
 
-def get_cuda_toolkit_path():
-    """
-    Get cuda_toolkit_path. It returns get_str_env_var('CUDA_TOOLKIT_PATH') if
-    set. Otherwise, attempts to discover a valid CUDA toolkit location and
-    return. If not found, return None.
-    """
-    # Check if the environment variable is already set, if so, return it immediately.
+
+@lru_cache(maxsize=1)
+def _find_nvdisasm_binary() -> str:
+    """Return absolute path to the bundled nvdisasm binary."""
+    from importlib import metadata
+
     try:
-        cuda_toolkit_path_existing = get_str_env_var("CUDA_TOOLKIT_PATH")
-        if cuda_toolkit_path_existing:
-            return cuda_toolkit_path_existing
+        dist = metadata.distribution("nvidia-cuda-nvdisasm")
+    except metadata.PackageNotFoundError:
+        dist = None
+    if dist is not None and dist.files is not None:
+        for entry in dist.files:
+            if entry.name == "nvdisasm":
+                binpath = Path(str(dist.locate_file(entry)))
+                if binpath.is_file():
+                    return str(binpath)
+    raise DSLUserCodeError(
+        "nvdisasm binary not found inside the nvidia-cuda-nvdisasm wheel.",
+        suggestion="\n".join(
+            [
+                "nvidia-cuda-nvdisasm is a runtime dependency of nvidia-cutlass-dsl",
+                "and should have been installed automatically. Try:",
+                "  • pip install --force-reinstall nvidia-cuda-nvdisasm",
+            ]
+        ),
+    )
 
-        found_cuda_home = _find_cuda_home()
-        if found_cuda_home:
-            return found_cuda_home
-    except Exception as e:
-        log().info("default_env: exception on get_cuda_toolkit_path", e)
-    return None
+
+def _check_nvdisasm_available(
+    prefix: str,
+    keep_sass: bool,
+) -> None:
+    """Check that nvdisasm is available when SASS output is requested."""
+    try:
+        _find_nvdisasm_binary()
+        return
+    except DSLUserCodeError:
+        pass
+    enabled_vars = []
+    if keep_sass:
+        enabled_vars.append(f"{prefix}_KEEP_SASS")
+    vars_str = " and ".join(enabled_vars)
+    raise DSLUserCodeError(DiagId.CONFIG_MISSING_NVDISASM, vars=vars_str)
 
 
-def get_prefix_dsl_libs(prefix: str):
+def dump_sass(
+    cubin_path: str,
+    sass_path: str | None,
+    flags: str,
+) -> None:
+    """Disassemble a CUBIN file into SASS.
+
+    If sass_path is None, the SASS is written to stderr.
+    Otherwise it is written to the given file path.
+    """
+    import shlex
+    import subprocess
+
+    if not cubin_path or not os.path.exists(cubin_path):
+        raise DSLUserCodeError(
+            f"Cannot dump SASS: CUBIN file does not exist at {cubin_path!r}."
+        )
+
+    nvdisasm = _find_nvdisasm_binary()
+    tokens = [nvdisasm, *shlex.split(flags), cubin_path]
+
+    if sass_path:
+        with open(sass_path, "w") as sass_file:
+            subprocess.run(tokens, stdout=sass_file, check=True)
+    else:
+        subprocess.run(tokens, stdout=sys.stderr, check=True)
+
+
+def get_prefix_dsl_libs(prefix: str) -> str | None:
     """
     Returns get_str_env_var('{prefix}_LIBS') if set.
     Otherwise, attempts to discover libs based on heuristics and return
@@ -234,21 +427,25 @@ def get_prefix_dsl_libs(prefix: str):
         if prefix_libs_existing:
             return prefix_libs_existing
 
-        def get_libs_cand(start):
-            target_libs = {
-                "mlir_c_runner_utils",
-                "mlir_runner_utils",
-                "mlir_cuda_runtime",
+        def get_libs_cand(start: str | Path) -> str | None:
+            target_dsl_runtime_libs = {
+                "cute_dsl_runtime",
             }
             lib_folder_guesses = [
                 "lib",
+                "cu12/lib",
+                "cu13/lib",
             ]
 
-            libs_cand = find_libs_in_ancestors(start, target_libs, lib_folder_guesses)
-            if libs_cand:
-                dsl_libs = ":".join(libs_cand)
-                return dsl_libs
-
+            for target_libs in [
+                target_dsl_runtime_libs,
+            ]:
+                libs_cand = find_libs_in_ancestors(
+                    start, target_libs, lib_folder_guesses
+                )
+                if libs_cand:
+                    dsl_libs = ":".join(libs_cand)
+                    return dsl_libs
             return None
 
         # find from install folder
@@ -258,15 +455,29 @@ def get_prefix_dsl_libs(prefix: str):
             # try to find from build folder structure
             dsl_libs = get_libs_cand(Path(__file__).parent.parent.resolve())
 
-        return dsl_libs
+        if dsl_libs:
+            return dsl_libs
+
+        # Known CuTe-family DSLs share libcute_dsl_runtime.so. With pip
+        # editable installs (`pip install -e`), the startup hook in
+        # cutlass/_pth_hook.py sets CUTE_DSL_LIBS but not the per-prefix
+        # variants, and the ancestor walk from the source tree cannot reach
+        # the build/vendored lib directory. Fall back to CUTE_DSL_LIBS for
+        # those aliases when their prefix-specific lookup fails.
+        if is_cutlass_family_dsl_prefix(prefix) and prefix != "CUTE_DSL":
+            fallback = os.getenv("CUTE_DSL_LIBS")
+            if fallback:
+                return fallback
+
+        return None
 
     except Exception as e:
-        log().info(f"default_env: exception on get_prefix_dsl_libs", e)
+        log().info("default_env: exception on get_prefix_dsl_libs", e)
     return None
 
 
 class LogEnvironmentManager:
-    def __init__(self, prefix="DSL"):
+    def __init__(self, prefix: str = "DSL") -> None:
         self.prefix = prefix
 
         # Logging options
@@ -281,7 +492,10 @@ class LogEnvironmentManager:
             and not self.log_to_file
         ):
             log().warning(
-                f"Log level was set, but neither logging to file ({prefix}_LOG_TO_FILE) nor logging to console ({prefix}_LOG_TO_CONSOLE) is enabled!"
+                "Log level was set, but neither logging to file (%s_LOG_TO_FILE) nor"
+                " logging to console (%s_LOG_TO_CONSOLE) is enabled!",
+                prefix,
+                prefix,
             )
         self.log_level = get_int_env_var(f"{prefix}_LOG_LEVEL", 1)
 
@@ -296,11 +510,31 @@ class EnvironmentVarManager(LogEnvironmentManager):
     - [DSL_NAME]_FILTER_STACKTRACE: Filter internal stacktrace (default: True)
     File options:
     - [DSL_NAME]_DUMP_DIR: Directory to dump the generated files (default: current working directory)
-    - [DSL_NAME]_KEEP_IR: Save generated IR in a file (default: False)
-    - [DSL_NAME]_KEEP_PTX: Save generated PTX in a file (default: False)
-    - [DSL_NAME]_KEEP_CUBIN: Save generated CUBIN in a file (default: False)
+    - [DSL_NAME]_CACHE_DIR: Cache directory (default: /tmp/{dsl_name}_python_cache_{tmpfile_suffix})
     - [DSL_NAME]_LOG_TO_FILE: Store all logging into a file, excluding COMPILE_LOGS (default: False)
+    - [DSL_NAME]_KEEP: Comma-separated list of artifacts to save to DUMP_DIR (default: "").
+        Tokens:
+          ir           — IR after canonicalize+cse (clean, human-readable)
+          ir-debug     — Raw IR before any passes
+          ptx          — PTX assembly
+          cubin        — CUBIN binary
+          sass         — SASS disassembly
+          all          — all of the above
+        Example: CUTE_DSL_KEEP=ir,ptx
+    # Deprecated — use [DSL_NAME]_KEEP instead:
+    - [DSL_NAME]_KEEP_IR: (deprecated) use KEEP=ir-debug
+    - [DSL_NAME]_KEEP_PTX: (deprecated) use KEEP=ptx
+    - [DSL_NAME]_KEEP_CUBIN: (deprecated) use KEEP=cubin
+    - [DSL_NAME]_KEEP_SASS: (deprecated) use KEEP=sass
     Other options:
+    - [DSL_NAME]_DEBUG: Master debug switch for DSL developers (default: False).
+      When True, raises the default of LINEINFO, SHOW_STACKTRACE (and disables
+      FILTER_STACKTRACE) and ENABLE_OPTIMIZATION_WARNINGS;
+      attributes MLIR ops to the closest (library) frame; and runs full
+      per-launch argument validation. These defaults remain independently
+      overridable by their own env vars. Trace-time MLIR op verification
+      (CUTE_DSL_VERIFY_TRACE) is always enabled while debug mode is on.
+    - [DSL_NAME]_SHOW_STACKTRACE: Show full stack traces on failure (default: False)
     - [DSL_NAME]_LINEINFO: Compile with `--lineinfo` enabling developer tools such as the profiler and debugger (default: False)
     - [DSL_NAME]_LOG_LEVEL: Logging level to set, for LOG_TO_CONSOLE or LOG_TO_FILE (default: 1).
     - [DSL_NAME]_DRYRUN: Generates IR only (default: False)
@@ -309,52 +543,141 @@ class EnvironmentVarManager(LogEnvironmentManager):
     - [DSL_NAME]_WARNINGS_IGNORE: Ignore warnings (default: False)
     - [DSL_NAME]_ENABLE_OPTIMIZATION_WARNINGS: Enable warnings of optimization warnings (default: False)
     - [DSL_NAME]_JIT_TIME_PROFILING: Whether or not to profile the IR generation/compilation/execution time (default: False)
+    - [DSL_NAME]_JIT_CACHE_MAX_ELEMS: Maximum number of JIT compiled functions to cache in memory (default: None). If None, the cache is unbounded.
+    - [DSL_NAME]_NO_CACHE: Disable JIT cache (default: False)
     - [DSL_NAME]_DISABLE_FILE_CACHING: Disable file caching (default: False)
-    - [DSL_NAME]_FILE_CACHING_CAPACITY: Limits the number of the cache save/load files (default: 1000)
     - [DSL_NAME]_LIBS: Path to dependent shared libraries (default: None)
+    - [DSL_NAME]_ENABLE_TVM_FFI: Enable TVM-FFI or not (default: False)
+    - [DSL_NAME]_LOC_TRACEBACKS: Maximum depth of location tracebacks (default: 0)
+    - [DSL_NAME]_COMPILER_OPT: Compact compiler option string (default: "").
+      Errors always show and fail compilation (no flag needed); warnings and
+      remarks are opt-in and non-fatal. A {<cat>} selector shows only that
+      category; bare shows all categories. Forms accepted:
+        warnings                    — show all warnings
+        warnings{nvvm}              — show only nvvm-category warnings
+        remarks                     — show all remarks
+        remarks{nvvm}               — show only nvvm (sync) remarks
+        iket                        — enable IKET (In-Kernel Event Tracing) instrumentation
+      Examples:
+        CUTE_DSL_COMPILER_OPT="warnings{nvvm}"
+        CUTE_DSL_COMPILER_OPT="iket"
+      The same option strings are accepted by cute.compile(..., options=...).
+
     """
 
-    def __init__(self, prefix="DSL"):
+    def __init__(self, prefix: str = "DSL") -> None:
         super().__init__(prefix)
+
+        # Master debug switch for DSL developers. When True, it raises the
+        # default of a curated set of diagnostic/correctness settings below
+        # (lineinfo, stacktrace, optimization warnings, IR verification).
+        # Each of those settings remains independently overridable by its own
+        # env var, so debugging mode only changes their defaults.
+        self.debug = get_bool_env_var(f"{prefix}_DEBUG", False)
 
         # Printing options
         self.print_after_preprocessor = get_bool_env_var(
             f"{prefix}_PRINT_AFTER_PREPROCESSOR", False
         )
         self.print_ir = get_bool_env_var(f"{prefix}_PRINT_IR", False)
-        self.filter_stacktrace = get_bool_env_var(f"{prefix}_FILTER_STACKTRACE", True)
-        self.lineinfo = get_bool_env_var(f"{prefix}_LINEINFO", False)
+        # SHOW_STACKTRACE (and DEBUG) show the full, unfiltered traceback, so
+        # internal-frame filtering is disabled by default in either mode.
+        self.show_stacktrace = get_bool_env_var(f"{prefix}_SHOW_STACKTRACE", self.debug)
+        self.filter_stacktrace = get_bool_env_var(
+            f"{prefix}_FILTER_STACKTRACE", not (self.debug or self.show_stacktrace)
+        )
+        self.lineinfo = get_bool_env_var(f"{prefix}_LINEINFO", self.debug)
+        self.no_cache = get_bool_env_var(f"{prefix}_NO_CACHE", False)
+        self.jit_cache_max_elems = get_int_or_none_env_var(
+            f"{prefix}_JIT_CACHE_MAX_ELEMS", None
+        )
+        if self.no_cache:
+            self.jit_cache_max_elems = 0
         self.dump_dir = get_str_env_var(
             f"{prefix}_DUMP_DIR", get_default_file_dump_root()
         )
-        self.keep_ptx = get_bool_env_var(f"{prefix}_KEEP_PTX", False)
-        self.keep_cubin = get_bool_env_var(f"{prefix}_KEEP_CUBIN", False)
-
         # File options
-        self.keep_ir = get_bool_env_var(f"{prefix}_KEEP_IR", False)
+        self.cache_dir = get_str_env_var(f"{prefix}_CACHE_DIR", None)
+
+        # ------------------------------------------------------------------ #
+        # Artifact keep — [DSL]_KEEP=<comma-list>                            #
+        # ------------------------------------------------------------------ #
+        # Parse new consolidated option.
+        _keep_raw = get_str_env_var(f"{prefix}_KEEP", "")
+        _keep_tokens: set[str] = set(
+            _parse_keep_tokens(_keep_raw, prefix) if _keep_raw else frozenset()
+        )
+
+        # Backward compatibility: publicly-documented old options emit a
+        # DeprecationWarning and fold into _keep_tokens.
+        if get_bool_env_var(f"{prefix}_KEEP_IR", False):
+            warnings.warn(
+                f"{prefix}_KEEP_IR is deprecated; use {prefix}_KEEP=ir-debug instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            _keep_tokens.add("ir-debug")
+        if get_bool_env_var(f"{prefix}_KEEP_PTX", False):
+            warnings.warn(
+                f"{prefix}_KEEP_PTX is deprecated; use {prefix}_KEEP=ptx instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            _keep_tokens.add("ptx")
+        if get_bool_env_var(f"{prefix}_KEEP_CUBIN", False):
+            warnings.warn(
+                f"{prefix}_KEEP_CUBIN is deprecated; use {prefix}_KEEP=cubin instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            _keep_tokens.add("cubin")
+
+        if get_bool_env_var(f"{prefix}_KEEP_SASS", False):
+            warnings.warn(
+                f"{prefix}_KEEP_SASS is deprecated; use {prefix}_KEEP=sass instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            _keep_tokens.add("sass")
+        self.keep_tokens: frozenset[str] = frozenset(_keep_tokens)
+
+        # Derived boolean attributes — used by compiler.py and dsl.py.
+        # keep_ir_clean: save IR after canonicalize+cse (the readable form).
+        self.keep_ir_clean: bool = "ir" in self.keep_tokens
+        # keep_ir: save raw IR before any passes (old KEEP_IR=1 semantics).
+        self.keep_ir: bool = "ir-debug" in self.keep_tokens
+        self.keep_ptx: bool = "ptx" in self.keep_tokens
+        self.keep_cubin: bool = "cubin" in self.keep_tokens
+        self.keep_sass: bool = "sass" in self.keep_tokens
+        check_sass = self.keep_sass
+        if check_sass:
+            _check_nvdisasm_available(
+                prefix,
+                self.keep_sass,
+            )
+        self.remarks = get_str_env_var(f"{prefix}_REMARKS", "")
+
         # Other options
         self.dryrun = get_bool_env_var(f"{prefix}_DRYRUN", False)
         self.arch = get_str_env_var(f"{prefix}_ARCH", detect_gpu_arch(prefix))
-        if self.arch.startswith("sm_110"):
-            self.arch = self.arch.replace("sm_110", "sm_101")
         self.warnings_as_errors = get_bool_env_var(
             f"{prefix}_WARNINGS_AS_ERRORS", False
         )
         self.warnings_ignore = get_bool_env_var(f"{prefix}_WARNINGS_IGNORE", False)
         self.enable_optimization_warnings = get_bool_env_var(
-            f"{prefix}_ENABLE_OPTIMIZATION_WARNINGS", False
+            f"{prefix}_ENABLE_OPTIMIZATION_WARNINGS", self.debug
         )
         self.disable_file_caching = get_bool_env_var(
             f"{prefix}_DISABLE_FILE_CACHING", False
         )
-        self.file_caching_capacity = get_int_env_var(
-            f"{prefix}_FILE_CACHING_CAPACITY", 1000
-        )
-        # set cuda
-        self.cuda_toolkit = get_cuda_toolkit_path()
+        self.compiler_opt = get_str_env_var(f"{prefix}_COMPILER_OPT", "")
 
         # set mlir shared libraries
         self.shared_libs = get_prefix_dsl_libs(prefix)
 
         # whether to enable assert in host and device code
         self.enable_assertions = get_bool_env_var(f"{prefix}_ENABLE_ASSERTIONS", False)
+
+        self.enable_tvm_ffi = get_bool_env_var(f"{prefix}_ENABLE_TVM_FFI", False)
+
+        self.loc_tracebacks = get_int_env_var(f"{prefix}_LOC_TRACEBACKS", 0)

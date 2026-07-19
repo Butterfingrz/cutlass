@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -50,6 +50,8 @@
 #include "cute/algorithm/gemm.hpp"
 #include "cute/numeric/arithmetic_tuple.hpp"
 
+#include "cutlass/detail/collective/moe_stride_utils.hpp"
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::collective {
@@ -63,6 +65,7 @@ template <
   int Stages,
   int SchedulerPipelineStageCount,
   int AccumulatorPipelineStageCount,
+  class ArchTag_,
   class ClusterShape,   // Static cluster shape or dynamic (int, int, _1)
   class TileShape_,     // (MmaAtomShapeM, MmaAtomShapeN, TileK)
   class ElementA_,
@@ -83,7 +86,8 @@ struct CollectiveMma<
       Stages,
       SchedulerPipelineStageCount,
       AccumulatorPipelineStageCount,
-      ClusterShape>,
+      ClusterShape,
+      ArchTag_>,
     TileShape_,
     ElementA_,
     StrideA_,
@@ -109,7 +113,8 @@ struct CollectiveMma<
                           Stages,
                           SchedulerPipelineStageCount,
                           AccumulatorPipelineStageCount,
-                          ClusterShape>;
+                          ClusterShape,
+                          ArchTag_>;
   using TileShape = TileShape_;
 
   static constexpr bool IsDynamicCluster = not cute::is_static_v<ClusterShape>;
@@ -257,9 +262,7 @@ struct CollectiveMma<
   // Host side kernel arguments
   struct Arguments {
     ArrayElementA const* ptr_A{nullptr};
-    InternalStrideA dA{};
     ArrayElementB const** ptr_B{nullptr};
-    StrideB dB{};
     RuntimeDataTypeA runtime_data_type_a{};
     RuntimeDataTypeB runtime_data_type_b{};
   };
@@ -296,9 +299,7 @@ struct CollectiveMma<
     RuntimeDataTypeB runtime_data_type_b;
     cute::TmaDescriptor* tensormaps;
     ArrayElementA const* ptr_A;
-    InternalStrideA dA;
     ArrayElementB const** ptr_B;
-    StrideB dB;
   };
 
   CUTLASS_DEVICE
@@ -343,7 +344,9 @@ struct CollectiveMma<
     init_M = get<0>(problem_shape_MNK);
     init_K_A = get<2>(problem_shape_MNK);
 
-    InternalStrideA stride_a = args.dA;
+    auto shape_a = make_shape(init_M, init_K_A, problem_shapes.groups());
+    InternalStrideA stride_a = cutlass::make_internal_packed_stride(InternalStrideA{}, shape_a);
+
     InternalStrideB stride_b = InternalStrideB{};
 
     // Batches/Groups are managed by using appropriate pointers to input matrices.
@@ -397,9 +400,7 @@ struct CollectiveMma<
       args.runtime_data_type_b,
       reinterpret_cast<cute::TmaDescriptor*>(workspace),
       args.ptr_A,
-      args.dA,
-      reinterpret_cast<ArrayElementB const**>(args.ptr_B),
-      args.dB
+      reinterpret_cast<ArrayElementB const**>(args.ptr_B)
     };
   }
 
@@ -812,7 +813,10 @@ struct CollectiveMma<
     cute::array<uint64_t, MaxTensorRank> prob_stride_B = {0,0,0,0,0};
 
     TmaInternalElementB const* ptr_B = nullptr;
-    Tensor tensor_b = make_tensor(ptr_B, make_shape(N,K,Int<1>{}), mainloop_params.dB[next_group]);
+    auto internal_shape_b = make_shape(static_cast<int>(N), static_cast<int>(K), 1);
+    InternalStrideB stride_b = cutlass::make_internal_packed_stride(InternalStrideB{}, internal_shape_b);
+
+    Tensor tensor_b = make_tensor(ptr_B, make_shape(N,K,Int<1>{}), stride_b);
 
     cute::detail::fill_tma_gmem_shape_stride(*observed_tma_load_b_, tensor_b,
                                              prob_shape_B, prob_stride_B);

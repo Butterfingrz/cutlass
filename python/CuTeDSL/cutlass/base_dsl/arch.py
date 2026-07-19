@@ -1,17 +1,18 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Use of this software is governed by the terms and conditions of the
 # NVIDIA End User License Agreement (EULA), available at:
-# https://docs.nvidia.com/cutlass/media/docs/pythonDSL/license.html
+# https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/license.html
 #
 # Any use, reproduction, disclosure, or distribution of this software
 # and related documentation outside the scope permitted by the EULA
 # is strictly prohibited.
 
+from collections.abc import Callable
 from enum import Enum
-import re
-from typing import Callable, List
+
+from .version_info import CUDA_VERSION
 
 
 class Arch(Enum):
@@ -29,51 +30,86 @@ class Arch(Enum):
     sm_100 = (10, 0, "")
     sm_100a = (10, 0, "a")
     sm_100f = (10, 0, "f")
-    sm_101 = (10, 1, "")
-    sm_101a = (10, 1, "a")
-    sm_101f = (10, 1, "f")
-    sm_110 = (11, 0, "")
-    sm_110a = (11, 0, "a")
-    sm_110f = (11, 0, "f")
+    if CUDA_VERSION.major >= 13:
+        sm_110 = (11, 0, "")
+        sm_110a = (11, 0, "a")
+        sm_110f = (11, 0, "f")
+        sm_101 = sm_110
+        sm_101a = sm_110a
+        sm_101f = sm_110f
+    else:
+        sm_101 = (10, 1, "")  # type: ignore[misc]
+        sm_101a = (10, 1, "a")  # type: ignore[misc]
+        sm_101f = (10, 1, "f")  # type: ignore[misc]
+        sm_110 = sm_101  # type: ignore[misc]
+        sm_110a = sm_101a  # type: ignore[misc]
+        sm_110f = sm_101f  # type: ignore[misc]
+    sm_103 = (10, 3, "")
+    sm_103a = (10, 3, "a")
+    sm_103f = (10, 3, "f")
     sm_120 = (12, 0, "")
     sm_120a = (12, 0, "a")
     sm_120f = (12, 0, "f")
     sm_121 = (12, 1, "")
     sm_121a = (12, 1, "a")
     sm_121f = (12, 1, "f")
-
-    def __init__(self, major, minor, suffix):
+    def __init__(self, major: int, minor: int, suffix: str) -> None:
         self.major = major
         self.minor = minor
         self.suffix = suffix
 
+    # attributes to get arch list of specific families
     @classmethod
-    def _missing_(cls, value):
-        """Support creating Arch enum from (major, minor, suffix) tuple"""
-        if not isinstance(value, tuple):
-            raise ValueError(f"invalid arguments for Arch: {value}")
-        major, minor, suffix = None, None, None
-        if len(value) == 2:
-            major, minor, suffix = *value, ""
-        else:
-            raise ValueError(f"invalid arguments for Arch: {value}")
-
-        return cls(major, minor, suffix)
-
-    def __repr__(self):
-        return self.__str__()
+    def AmpereArchs(cls) -> tuple["Arch", ...]:
+        return (Arch.sm_80, Arch.sm_86, Arch.sm_87)
 
     @classmethod
-    def from_string(cls, arch_str):
-        pattern = r"^(?:sm_?|SM_?)?(\d+)(\d)([af]?)$"
-        match = re.match(pattern, arch_str)
-        if not match:
-            raise ValueError(f"Invalid architecture string format: {arch_str}")
-        major, minor, suffix = match.groups()
-        return cls((int(major), int(minor), suffix))
+    def AdaArchs(cls) -> tuple["Arch", ...]:
+        return (Arch.sm_89,)
 
     @classmethod
-    def filter(cls, criterion: Callable[["Arch"], bool]) -> List["Arch"]:
+    def HopperArchs(cls) -> tuple["Arch", ...]:
+        return (Arch.sm_90, Arch.sm_90a)
+
+    @classmethod
+    def BlackwellArchs(cls) -> tuple["Arch", ...]:
+        archs = (
+            Arch.sm_100,
+            Arch.sm_100a,
+            Arch.sm_100f,
+            Arch.sm_101,
+            Arch.sm_101a,
+            Arch.sm_101f,
+            Arch.sm_103,
+            Arch.sm_103a,
+            Arch.sm_103f,
+            Arch.sm_110,
+            Arch.sm_110a,
+            Arch.sm_110f,
+            Arch.sm_120,
+            Arch.sm_120a,
+            Arch.sm_120f,
+            Arch.sm_121,
+            Arch.sm_121a,
+            Arch.sm_121f,
+        )
+        return tuple(dict.fromkeys(archs))
+
+    def __str__(self) -> str:
+        return self.name
+
+    def __repr__(self) -> str:
+        return f"Arch.{self.name}"
+
+    @classmethod
+    def from_string(cls, arch_str: str) -> "Arch":
+        return cls[arch_str]
+
+    def to_string(self) -> str:
+        return self.name
+
+    @classmethod
+    def filter(cls, criterion: Callable[["Arch"], bool]) -> list["Arch"]:
         """
         Filter the archs by the given criterion.
         """
@@ -94,7 +130,7 @@ class Arch(Enum):
         """
         # sm_101 is renamed to sm_110, sm_101f is family of sm_110f, but is not family of sm_100f
         if self in [Arch.sm_101a, Arch.sm_101f]:
-            return arch.major == 11 and arch.minor == 0
+            return arch in [Arch.sm_101, Arch.sm_101a, Arch.sm_101f]
 
         return (
             self.major == arch.major
@@ -102,22 +138,44 @@ class Arch(Enum):
             and self.suffix in ["a", "f"]
         )
 
-    def __lt__(self, other):
+    def can_run_binary_built_for(self, target: "Arch") -> bool:
+        """Whether hardware of this (runtime) arch can execute a cubin built for ``target``.
+
+        Arch-conditional targets (``a`` suffix, e.g. ``sm_100a``) run only on their exact
+        arch. Family-portable (``f``) and baseline (no suffix) targets run on any hardware
+        in the same major family whose minor is at least the target's minor (e.g. an
+        ``sm_100f`` binary runs on ``sm_100a`` and ``sm_103a``).
+        """
+        if self == target:
+            return True
+        if self.major != target.major:
+            return False
+        # sm_101 is the renamed sm_110: a distinct family that only shares the (10,1)
+        # major.minor space with sm_10x when CUDA_VERSION.major < 13. Keep it from
+        # matching sm_100/sm_103 binaries in either direction (mirrors is_family_of).
+        sm_101_family = (Arch.sm_101, Arch.sm_101a, Arch.sm_101f)
+        if (self in sm_101_family) != (target in sm_101_family):
+            return False
+        if target.suffix == "a":
+            return self == target
+        return self.minor >= target.minor
+
+    def __lt__(self, other: object) -> bool:
         if not isinstance(other, Arch):
             return NotImplemented
         return (self.major, self.minor) < (other.major, other.minor)
 
-    def __le__(self, other):
+    def __le__(self, other: object) -> bool:
         if not isinstance(other, Arch):
             return NotImplemented
         return (self.major, self.minor) <= (other.major, other.minor)
 
-    def __gt__(self, other):
+    def __gt__(self, other: object) -> bool:
         if not isinstance(other, Arch):
             return NotImplemented
         return (self.major, self.minor) > (other.major, other.minor)
 
-    def __ge__(self, other):
+    def __ge__(self, other: object) -> bool:
         if not isinstance(other, Arch):
             return NotImplemented
         return (self.major, self.minor) >= (other.major, other.minor)

@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2025 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -102,8 +102,10 @@ sm100_compute_stage_count_or_override_blockwise(StageCountAutoCarveout<carveout_
 
   constexpr int stage_bytes =
     cutlass::round_nearest(
-      cutlass::bits_to_bytes(a_bits * size<0>(TileShapeMNK{}) * size<2>(TileShapeMNK{})) +
-      cutlass::bits_to_bytes(b_bits * size<1>(TileShapeMNK{}) * size<2>(TileShapeMNK{})) +
+      cutlass::bits_to_bytes(a_bits * size<0>(TileShapeMNK{}) * size<2>(TileShapeMNK{})
+      ) +
+      cutlass::bits_to_bytes(b_bits * size<1>(TileShapeMNK{}) * size<2>(TileShapeMNK{})
+      ) +
       cutlass::bits_to_bytes(scale_bits * size<0>(ScaleShapeMNK{}) * size<2>(ScaleShapeMNK{})) +
       cutlass::bits_to_bytes(scale_bits * size<1>(ScaleShapeMNK{}) * size<2>(ScaleShapeMNK{})),
       128) +
@@ -373,8 +375,7 @@ struct CollectiveBuilder<
     >::KernelSmemCarveout;
   // Reduce SMEM capacity available for buffers considering barrier allocations.
   
-  static constexpr int ReducedSmemCapacityBytes = 
-    cutlass::gemm::collective::detail::sm100_smem_capacity_bytes - KernelSmemCarveout;
+  static constexpr int ReducedSmemCapacityBytes = detail::sm100_reduced_smem_capacity_bytes<ArchTag, KernelSmemCarveout>();
 
   using SmemTileShape = cute::Shape<BlockTileA_M, BlockTileB_N, BlockTileA_K>;
   using MainloopABPipelineStorage = typename cutlass::PipelineTmaUmmaAsync<1>::SharedStorage;
@@ -415,12 +416,14 @@ struct CollectiveBuilder<
       PipelineStages,
       SchedulerPipelineStageCount,
       AccumulatorPipelineStageCount,
-      ClusterShape_MNK>,
+      ClusterShape_MNK,
+      ArchTag>,
     cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockwiseScaling<
       PipelineStages,
       SchedulerPipelineStageCount,
       AccumulatorPipelineStageCount,
-      ClusterShape_MNK>>;
+      ClusterShape_MNK,
+      ArchTag>>;
 
   using CollectiveOp = cutlass::gemm::collective::CollectiveMma<
       DispatchPolicy,
@@ -440,7 +443,6 @@ struct CollectiveBuilder<
       cute::identity
     >;
 };
-
 
 } // namespace cutlass::gemm::collective
 

@@ -1,16 +1,17 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Use of this software is governed by the terms and conditions of the
 # NVIDIA End User License Agreement (EULA), available at:
-# https://docs.nvidia.com/cutlass/media/docs/pythonDSL/license.html
+# https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/license.html
 #
 # Any use, reproduction, disclosure, or distribution of this software
 # and related documentation outside the scope permitted by the EULA
 # is strictly prohibited.
 
-from typing import Type, Union, Tuple, Optional
+from typing import Any, Type, Union, Tuple, Optional
 
+from cutlass._mlir import ir
 from cutlass.utils.layout import LayoutEnum
 from cutlass.cutlass_dsl import (
     Float16,
@@ -25,13 +26,12 @@ from cutlass.cutlass_dsl import (
 )
 
 import cutlass.cute as cute
-from cutlass.cute.nvgpu.common import CopyUniversalOp
+from cutlass.cute.nvgpu.common import CopyUniversalOp, OperandMajorMode
 from cutlass.cute.nvgpu.warp import StMatrix8x8x16bOp
 from cutlass.cute.nvgpu.warpgroup import (
     MmaF16BF16Op,
     MmaF8Op,
     MmaI8Op,
-    OperandMajorMode,
     OperandSource as WarpgroupOperandSource,
     make_smem_layout_atom,
 )
@@ -46,8 +46,8 @@ def get_smem_store_op(
     elem_ty_d: Type[Numeric],
     elem_ty_acc: Type[Numeric],
     *,
-    loc=None,
-    ip=None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> cute.CopyAtom:
     """
     Selects the largest vectorized smem store atom available subject to constraint of gmem layout.
@@ -68,7 +68,7 @@ def get_smem_store_op(
     Either SmemStoreMatrix or SimtSyncCopy, based on the input parameters.
     """
 
-    def validate_type(ty, ty_name):
+    def validate_type(ty: Type[Numeric], ty_name: str) -> None:
         if not isinstance(ty, NumericMeta):
             raise TypeError(f"{ty_name} must be a Numeric, but got {ty}")
 
@@ -99,8 +99,8 @@ def make_trivial_tiled_mma(
     tiler_mn: Tuple[int, int],
     a_source: OperandSource = OperandSource.SMEM,
     *,
-    loc=None,
-    ip=None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> cute.TiledMma:
     """Make a tiled MMA atom with given data type, leading dimension, cta group and mma tile shape.
     By default, the MMA atom is created with SMEM operand source for A.
@@ -110,9 +110,9 @@ def make_trivial_tiled_mma(
     :param b_dtype: Data type of operand B.
     :type b_dtype: type[Numeric]
     :param a_leading_mode: Leading dimension of operand A (1 for K, 0 for M/N).
-    :type a_leading_mode: warpgroup.OperandMajorMode
+    :type a_leading_mode: cutlass.cute.nvgpu.OperandMajorMode
     :param b_leading_mode: Leading dimension of operand B (1 for K, 0 for M/N).
-    :type b_leading_mode: warpgroup.OperandMajorMode
+    :type b_leading_mode: cutlass.cute.nvgpu.OperandMajorMode
     :param acc_dtype: Data type of the accumulator.
     :type acc_dtype: type[Numeric]
     :param atom_layout_mnk: A integer tuple describing the tiling of Atom across threads.
@@ -126,6 +126,7 @@ def make_trivial_tiled_mma(
     :raises TypeError: If the data type is not supported.
     """
 
+    mma_op: Any
     if a_dtype in {Float16, BFloat16}:
         if a_dtype != b_dtype:
             raise TypeError(f"Type mismatch: {a_dtype} != {b_dtype}")
@@ -175,9 +176,9 @@ def get_smem_layout_atom(
     element_type: Type[Numeric],
     major_mode_size: int,
     *,
-    loc=None,
-    ip=None,
-):
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Any:
     """Select the optimal shared memory layout atom based on parameters.
 
     :param layout: Layout enum of the tensor
@@ -188,7 +189,7 @@ def get_smem_layout_atom(
     :type major_mode_size: int
 
     :return: Selected shared memory layout atom kind
-    :rtype: cute.nvgpu.warpgroup.SmemLayoutAtomKind
+    :rtype: cutlass.cute.nvgpu.warpgroup.SmemLayoutAtomKind
     """
     assert major_mode_size % 8 == 0
     sw128_num_contiguous_bits = 1024
@@ -219,8 +220,8 @@ def make_smem_layout_a(
     a_dtype: Type[Numeric],
     num_stages: int,
     *,
-    loc=None,
-    ip=None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Union[cute.Layout, cute.ComposedLayout]:
     """This function helps with:
 
@@ -242,12 +243,15 @@ def make_smem_layout_a(
     :rtype: Union[cute.Layout, cute.ComposedLayout]
     """
     # Extract A tensor shape from the MMA tiler (M dimension)
+    assert isinstance(mma_tiler_mnk, tuple)
     a_tile_shape_mnk = mma_tiler_mnk
     a_smem_shape = cute.slice_(a_tile_shape_mnk, (None, 0, None), loc=loc, ip=ip)
 
     # Determine if K is the major mode and get the major mode size
     is_k_major = a_layout.is_k_major_a()
-    a_major_mode_size = a_tile_shape_mnk[2] if is_k_major else a_tile_shape_mnk[0]
+    a_major_mode_size = cute.size(
+        a_tile_shape_mnk[2] if is_k_major else a_tile_shape_mnk[0]
+    )
 
     # Create SMEM layout atom for A tensor based on major mode and data type
     a_smem_layout_atom = make_smem_layout_atom(
@@ -261,7 +265,7 @@ def make_smem_layout_a(
     a_smem_layout_staged = cute.tile_to_shape(
         a_smem_layout_atom,
         cute.append(a_smem_shape, num_stages),
-        order=(0, 1, 2) if is_k_major else (0, 1, 2),
+        order=(0, 1, 2) if is_k_major else (1, 0, 2),
         loc=loc,
         ip=ip,
     )
@@ -276,8 +280,8 @@ def make_smem_layout_b(
     b_dtype: Type[Numeric],
     num_stages: int,
     *,
-    loc=None,
-    ip=None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Union[cute.Layout, cute.ComposedLayout]:
     """This function helps with:
 
@@ -299,11 +303,12 @@ def make_smem_layout_b(
     :rtype: Union[cute.Layout, cute.ComposedLayout]
     """
     # Extract B tensor shape from the MMA tiler (N and K dimensions)
+    assert isinstance(mma_tiler_mnk, tuple)
     b_smem_shape = cute.slice_(mma_tiler_mnk, (0, None, None), loc=loc, ip=ip)
 
     # Determine if K is the major mode and get the major mode size
     is_k_major = b_layout.is_k_major_b()
-    b_major_mode_size = mma_tiler_mnk[2] if is_k_major else mma_tiler_mnk[1]
+    b_major_mode_size = cute.size(mma_tiler_mnk[2] if is_k_major else mma_tiler_mnk[1])
 
     # Create SMEM layout atom for B tensor based on major mode and data type
     b_smem_layout_atom = make_smem_layout_atom(
@@ -334,8 +339,8 @@ def make_smem_layout_epi(
     smem_trg_shape: Optional[cute.Layout] = None,
     smem_order: Optional[tuple] = None,
     *,
-    loc=None,
-    ip=None,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
 ) -> Union[cute.Layout, cute.ComposedLayout]:
     """This function helps:
 
@@ -361,6 +366,7 @@ def make_smem_layout_epi(
     :rtype: Union[cute.Layout, cute.ComposedLayout]
     """
     # Extract output tensor shape from epilog tile
+    assert isinstance(epi_tile, tuple)
     o_smem_shape = epi_tile
 
     # Determine major mode size based on layout (M or N major)

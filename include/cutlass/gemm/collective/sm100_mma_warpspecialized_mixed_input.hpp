@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -65,6 +65,7 @@ template <
   int Transform2MmaPipelineStageCount_,
   int SchedulerPipelineStageCount_,
   int AccumulatorPipelineStageCount_,
+  class ArchTag_,
   class ClusterShape,
   class TileShape_,
   class ElementAOptionalTuple_,
@@ -86,7 +87,8 @@ struct CollectiveMma<
       Transform2MmaPipelineStageCount_,
       SchedulerPipelineStageCount_,
       AccumulatorPipelineStageCount_,
-      ClusterShape>,
+      ClusterShape,
+      ArchTag_>,
     TileShape_,
     ElementAOptionalTuple_,
     StridePairA_,
@@ -115,7 +117,8 @@ public:
                             Transform2MmaPipelineStageCount_,
                             SchedulerPipelineStageCount_,
                             AccumulatorPipelineStageCount_,
-                            ClusterShape>;
+                            ClusterShape,
+                            ArchTag_>;
   using TileShape = TileShape_;
   using TiledMma = TiledMma_;
   using KernelSchedule = typename DispatchPolicy::Schedule;

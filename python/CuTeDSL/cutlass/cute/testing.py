@@ -1,13 +1,14 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Use of this software is governed by the terms and conditions of the
 # NVIDIA End User License Agreement (EULA), available at:
-# https://docs.nvidia.com/cutlass/media/docs/pythonDSL/license.html
+# https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/license.html
 #
 # Any use, reproduction, disclosure, or distribution of this software
 # and related documentation outside the scope permitted by the EULA
 # is strictly prohibited.
+
 
 import functools
 import inspect
@@ -15,89 +16,392 @@ import logging
 import os
 from itertools import product
 from time import time
-from typing import Type, Union, Callable, Optional, Dict, List, Any
+from typing import Any, Callable, Dict, List, Optional, Type
 
-import cuda.bindings.driver as cuda_driver
-import cuda.bindings.runtime as cuda_runtime
+from cutlass.cutlass_dsl import Constexpr, CuTeDSL, T, dsl_user_op, const_expr
 
-import cutlass.base_dsl.jit_executor
-from cutlass.cutlass_dsl import Constexpr, CuTeDSL, T, dsl_user_op
+from .typing import (
+    Numeric,
+    Int8,
+    Boolean,
+    Tensor,
+    Layout,
+    Shape,
+    is_int_tuple_type,
+)
 
-from .typing import Numeric, Int8, Boolean
+from . import nvgpu
+from .core import recast_layout, make_layout, composition, get, rank, size
+from .tuple import elem_less
+from .tensor import (
+    make_rmem_tensor,
+    recast_tensor,
+    make_identity_tensor,
+    TensorSSA,
+    _Tensor,
+)
+from .atom import make_copy_atom
+from .algorithm import copy
+from .core import zipped_divide
+from .runtime import from_dlpack
 
-import cutlass.cute as cute
-from cutlass.cute import nvgpu
-
+from cutlass._mlir import ir
 from cutlass._mlir.dialects import builtin, cf, nvvm, vector
 
 
 @dsl_user_op
-def assert_(cond, msg=None, *, loc=None, ip=None):
+def assert_(
+    cond: object,
+    msg: Optional[str] = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
     cf.assert_(Boolean(cond).ir_value(), msg if msg else "", loc=loc, ip=ip)
 
 
-def _maybe_recast_tensor_from_f4(src: cute.Tensor, tv_layout: cute.Layout):
-    if src.element_type.width == 4:
-        tv_layout = cute.recast_layout(8, 4, tv_layout)
-        src = cute.recast_tensor(src, dtype=Int8)
+################################################
+# Runtime Assertion Helper Utilities For Testing
+################################################
+
+
+class AssertionError(RuntimeError):
+    """Custom assertion error for runtime assertions."""
+
+    pass
+
+
+class Assertion:
+    """Base class for runtime assertion."""
+
+    pass
+
+
+class _CompileTimeAssertion(Assertion):
+    """Compile-time assertion helper that tracks assertion results during execution.
+
+    This assertion is used internally when RuntimeAssertion is passed through
+    JIT compilation. It stores assertion results in a tensor and provides compile-time
+    tracking of assertion results.
+    """
+
+    def __init__(
+        self,
+        tensor: Optional[Tensor],
+        num_assertions: int = 1,
+        msgs: Optional[list[str]] = None,
+        device: Optional[str] = None,
+        disable: bool = False,
+        init_value: bool = False,
+        used_indices: Optional[set[int]] = None,
+    ) -> None:
+        """Initialize _CompileTimeAssertion.
+
+        :param tensor: Tensor to store assertion results
+        :param num_assertions: Number of assertions to support
+        :param msgs: List of assertion messages
+        :param device: Device to run assertions on
+        :param disable: If True, assertions are disabled
+        :param init_value: Initial value for assertion tensor
+        :param used_indices: Set of used assertion indices
+        """
+        if msgs is None:
+            msgs = []
+        self._tensor = tensor
+        self._num_assertions = num_assertions
+        self._device = device
+        self._disable = disable
+        self._msgs = msgs
+        self._init_value = init_value
+        self._used_indices = used_indices
+
+    def __new_from_mlir_values__(
+        self, values: list[ir.Value]
+    ) -> "_CompileTimeAssertion":
+        if self._disable:
+            return _CompileTimeAssertion(
+                None,
+                self._num_assertions,
+                self._msgs,
+                self._device,
+                self._disable,
+                self._init_value,
+                self._used_indices,
+            )
+        return _CompileTimeAssertion(
+            _Tensor(values[0], dtype=Boolean),
+            self._num_assertions,
+            self._msgs,
+            self._device,
+            self._disable,
+            self._init_value,
+            self._used_indices,
+        )
+
+    def __extract_mlir_values__(self) -> list[ir.Value]:
+        if self._disable:
+            return []
+        assert self._tensor is not None
+        return self._tensor.__extract_mlir_values__()  # type: ignore[attr-defined]
+
+    @dsl_user_op
+    @CuTeDSL.jit
+    def store(
+        self,
+        idx: Constexpr,
+        pred: Boolean,
+        msg: str = "",
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> None:
+        """Assert a predicate condition.
+
+        :param idx: Assertion index
+        :type idx: int
+        :param pred: Predicate condition to assert
+        :type pred: Boolean
+        :param msg: Assertion message
+        :type msg: str, optional
+        :param loc: MLIR location information for debugging, defaults to None
+        :type loc: optional
+        :param ip: MLIR insertion point for code generation, defaults to None
+        :type ip: optional
+        """
+        if const_expr(self._disable):
+            return
+        if const_expr(not isinstance(idx, int)):
+            raise ValueError(f"expects idx to be 'int', but got {type(idx)}")
+        if const_expr(idx >= self._num_assertions):
+            raise ValueError("please increase the number of assertions!!!")
+        if const_expr(self._init_value is True):
+            self._tensor[idx] = pred and self._tensor[idx]  # type: ignore[index]
+        else:
+            self._tensor[idx] = pred  # type: ignore[index]
+        self._msgs[idx] = f"{msg}\nAt {loc}"
+        self._used_indices.add(idx)  # type: ignore[union-attr]
+
+    def __enter__(self) -> "_CompileTimeAssertion":
+        """Enter context manager."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[object],
+    ) -> None:
+        """Exit context manager and verify assertions if no exception occurred."""
+        # Only verify if there was no exception in the with block
+        if exc_type is None and not self._disable:
+            # _CompileTimeAssertion doesn't have verify method as it's checked at compile time
+            pass
+
+
+class RuntimeAssertion(Assertion):
+    """Runtime assertion helper that verifies conditions at runtime.
+    ```python
+    There are two modes to use RuntimeAssertion:
+    1. Manual mode - explicitly call verify():
+    ```python
+        @cute.jit
+        def jit_func(assertions: Assertion):
+            assertions.store(0, pred, "assertion failed")
+        assertions = cute.testing.RuntimeAssertion(num_assertions=1)
+        jit_func(assertions)
+        assertions.verify()
+    ```
+
+    2. Context manager mode - automatically verifies on exit:
+    ```python
+        with cute.testing.RuntimeAssertion(num_assertions=1) as assertions:
+            jit_func(assertions)
+        # verify() is called automatically after the with block
+    ```
+    """
+
+    def __init__(
+        self,
+        num_assertions: int = 1,
+        device: Optional[str] = None,
+        disable: bool = False,
+        init_value: bool = False,
+    ) -> None:
+        """Initialize _RuntimeAssertion.
+
+        :param num_assertions: Number of assertions to support
+        :param device: Device to run assertions on (None for CPU, "cuda" for GPU)
+        :param disable: If True, assertions are disabled
+        :param init_value: Initial value for assertion tensor
+        """
+        self._num_assertions = num_assertions
+        self._device = device
+        self._disable = disable
+        self._msgs = [""] * num_assertions
+        self._init_value = init_value
+        self._used_indices: set[int] = set()
+        if self._disable:
+            return
+        import torch
+
+        self._torch_tensor = torch.full(
+            (self._num_assertions,),
+            device=self._device,
+            dtype=torch.bool,
+            fill_value=init_value,
+        )
+        self._tensor = from_dlpack(self._torch_tensor)
+
+    def __c_pointers__(self) -> list[Any]:
+        """Get C pointers for passing to JIT functions."""
+        if self._disable:
+            return []
+        return self._tensor.__c_pointers__()  # type: ignore[attr-defined]
+
+    def __get_mlir_types__(self) -> list[Any]:
+        """Get MLIR types for code generation."""
+        if self._disable:
+            return []
+        return self._tensor.__get_mlir_types__()  # type: ignore[attr-defined]
+
+    def __new_from_mlir_values__(self, values: list[ir.Value]) -> _CompileTimeAssertion:
+        """Create new instance from MLIR values (for JIT compilation)."""
+        if self._disable:
+            return _CompileTimeAssertion(
+                None,
+                self._num_assertions,
+                self._msgs,
+                self._device,
+                self._disable,
+                self._init_value,
+                self._used_indices,
+            )
+        return _CompileTimeAssertion(
+            _Tensor(values[0], dtype=Boolean),
+            self._num_assertions,
+            self._msgs,
+            self._device,
+            self._disable,
+            self._init_value,
+            self._used_indices,
+        )
+
+    def verify(self) -> None:
+        """Verify all assertions have passed."""
+        if self._disable:
+            return
+        import torch
+
+        if self._device is not None:
+            torch.cuda.synchronize()
+        false_indices = torch.where(self._torch_tensor == False)[0].tolist()
+        valid_indices = [idx for idx in false_indices if idx in self._used_indices]
+        if len(valid_indices) > 0:
+            # emit the first assertion error.
+            raise AssertionError(self._msgs[valid_indices[0]])
+
+    def __enter__(self) -> "RuntimeAssertion":
+        """Enter the context manager, returns self for use in 'with' statement."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[object],
+    ) -> None:
+        """Exit the context manager, automatically calls verify()."""
+        if exc_type is None:
+            self.verify()
+
+
+def _maybe_recast_tensor_from_f4_f6(
+    src: Tensor, tv_layout: Layout
+) -> tuple[Tensor, Layout]:
+    elem_type = src.element_type
+    assert not is_int_tuple_type(elem_type)
+    if elem_type.width == 4:
+        tv_layout = recast_layout(8, 4, tv_layout)
+        src = recast_tensor(src, dtype=Int8)
+    elif elem_type.width == 6:
+        tv_layout = recast_layout(8, 6, tv_layout)
+        src = recast_tensor(src, dtype=Int8)
     return src, tv_layout
 
 
-def _maybe_recast_to_f4(input: cute.TensorSSA, dtype: Type[Numeric]):
-    """Conditionally recasts the tensor to 4-bit type if the destination type is 4-bit.
+def _maybe_recast_to_f4_f6(input: TensorSSA, dtype: Type[Numeric]) -> TensorSSA:
+    """Conditionally recasts the tensor to 4-bit or 6-bit type if the destination type is 4-bit or 6-bit.
 
     :param input: The input tensor to recast.
     :param dtype: The target numeric type to potentially recast to.
     :raises TypeError: If dtype is not a subclass of Numeric.
-    :return: A new tensor recast to 4-bit if dtype is 4-bit, otherwise returns self unchanged.
+    :return: A new tensor recast to 4-bit or 6-bit if dtype is 4-bit or 6-bit, otherwise returns self unchanged.
     """
     if not inspect.isclass(dtype) or not issubclass(dtype, Numeric):
         raise TypeError(f"dst_ty must be a type of Numeric, but got {dtype}")
 
     if dtype.width == 4:
-        recast_shape = cute.recast_layout(4, 8, cute.make_layout(input.shape)).shape
+        recast_shape = recast_layout(4, 8, make_layout(input.shape)).shape
         i4_vec = vector.bitcast(
             T.vector(input.type.shape[0] * 2, T.i(4)), input.maybe_downcast()
         )
         res_vect = builtin.unrealized_conversion_cast(
             [T.vector(i4_vec.type.shape[0], dtype.mlir_type)], [i4_vec]
         )
-        return cute.TensorSSA(res_vect, recast_shape, dtype)
+        return TensorSSA(res_vect, recast_shape, dtype)
+    elif dtype.width == 6:
+        recast_shape = recast_layout(6, 8, make_layout(input.shape)).shape
+        n = input.type.shape[0]
+        assert (n * 8) % 6 == 0, (
+            f"N * 8 must be divisible by 6 for fp6 unpacking, got N={n}"
+        )
+        res_vect = vector.bitcast(
+            T.vector(n * 8 // 6, dtype.mlir_type), input.maybe_downcast()
+        )
+        return TensorSSA(res_vect, recast_shape, dtype)
     return input
 
 
-def _maybe_recast_from_f4(input: cute.TensorSSA, src_dtype: Type[Numeric]):
-    """Conditionally recasts the tensor from 4-bit type if the source type is 4-bit.
+def _maybe_recast_from_f4_f6(input: TensorSSA, src_dtype: Type[Numeric]) -> TensorSSA:
+    """Conditionally recasts the tensor from 4-bit or 6-bit type if the source type is 4-bit or 6-bit.
 
     :param input: The input tensor to recast.
     :param src_dtype: The source numeric type to potentially recast from.
     :raises TypeError: If src_dtype is not a subclass of Numeric.
-    :return: A new tensor recast from 4-bit if src_dtype is 4-bit, otherwise returns self unchanged.
+    :return: A new tensor recast from 4-bit or 6-bit if src_dtype is 4-bit or 6-bit, otherwise returns self unchanged.
     """
     if not inspect.isclass(src_dtype) or not issubclass(src_dtype, Numeric):
         raise TypeError(f"src_ty must be a type of Numeric, but got {src_dtype}")
 
     if src_dtype.width == 4:
-        recast_shape = cute.recast_layout(8, 4, cute.make_layout(input.shape)).shape
+        recast_shape = recast_layout(8, 4, make_layout(input.shape)).shape
         i4_vec = builtin.unrealized_conversion_cast(
             [T.vector(input.type.shape[0], T.i(4))], [input.maybe_downcast()]
         )
         res_vect = vector.bitcast(T.vector(i4_vec.type.shape[0] // 2, T.i8()), i4_vec)
-        return cute.TensorSSA(res_vect, recast_shape, Int8)
+        return TensorSSA(res_vect, recast_shape, Int8)
+    elif src_dtype.width == 6:
+        recast_shape = recast_layout(8, 6, make_layout(input.shape)).shape
+        n = input.type.shape[0]
+        assert (n * 6) % 8 == 0, (
+            f"N * 6 must be divisible by 8 for i8 packing, got N={n}"
+        )
+        res_vect = vector.bitcast(T.vector(n * 6 // 8, T.i8()), input.maybe_downcast())
+        return TensorSSA(res_vect, recast_shape, Int8)
     return input
 
 
 @CuTeDSL.kernel
 def _convert_kernel(
-    gSrc: cute.Tensor,
-    gDst: cute.Tensor,
-    cSrc: cute.Tensor,
-    src_tv_layout: cute.Layout,
-    dst_tv_layout: cute.Layout,
-    src_shape: cute.Shape,
-    src_ty,
-    dst_ty,
-):
+    gSrc: Tensor,
+    gDst: Tensor,
+    cSrc: Tensor,
+    src_tv_layout: Layout,
+    dst_tv_layout: Layout,
+    src_shape: Shape,
+    src_ty: Type[Numeric],
+    dst_ty: Type[Numeric],
+) -> None:
     tidx = nvvm.read_ptx_sreg_tid_x(T.i32())
     bidx = nvvm.read_ptx_sreg_ctaid_x(T.i32())
 
@@ -110,9 +414,9 @@ def _convert_kernel(
 
     # compose with CTA TV layout
     # tid, vid -> address
-    tidfrgSrc = cute.composition(ctaSrc, src_tv_layout)  # (T,V)
-    tidfrgDst = cute.composition(ctaDst, dst_tv_layout)  # (T,V)
-    tidfrgCSrc = cute.composition(ctaCSrc, src_tv_layout)  # (T,V)
+    tidfrgSrc = composition(ctaSrc, src_tv_layout)  # type: ignore[arg-type]  # (T,V)
+    tidfrgDst = composition(ctaDst, dst_tv_layout)  # type: ignore[arg-type]  # (T,V)
+    tidfrgCSrc = composition(ctaCSrc, src_tv_layout)  # type: ignore[arg-type]  # (T,V)
     # print(f"tidfrgSrc = {tidfrgSrc.type}")
 
     # slice for threads
@@ -123,71 +427,65 @@ def _convert_kernel(
     # print(f"thrSrc = {thrSrc.type}")
 
     # predicate
-    if cute.elem_less(thrCSrc[0], src_shape):
+    if elem_less(thrCSrc[0], src_shape):
         # allocate fragments for gmem->rmem
-        frgSrc = cute.make_rmem_tensor(
-            cute.get(src_tv_layout, mode=[1]), gSrc.element_type
+        frgSrc = make_rmem_tensor(
+            get(src_tv_layout, mode=[1]), gSrc.element_type
         )  # (V)
-        frgDst = cute.make_rmem_tensor(
-            cute.get(dst_tv_layout, mode=[1]), gDst.element_type
+        frgDst = make_rmem_tensor(
+            get(dst_tv_layout, mode=[1]), gDst.element_type
         )  # (V)
         # print(f"frgSrc = {frgSrc.type}")
 
         # Move data to reg address space
-        copy_atom_load = cute.make_copy_atom(nvgpu.CopyUniversalOp(), gSrc.element_type)
-        cute.copy(copy_atom_load, thrSrc, frgSrc)
+        copy_atom_load = make_copy_atom(nvgpu.CopyUniversalOp(), gSrc.element_type)
+        copy(copy_atom_load, thrSrc, frgSrc)
 
         vec_src = frgSrc.load()
-        vec_src = _maybe_recast_to_f4(vec_src, src_ty)
+        vec_src = _maybe_recast_to_f4_f6(vec_src, src_ty)
         vec_dst = vec_src.to(dst_ty)
-        vec_dst = _maybe_recast_from_f4(vec_dst, dst_ty)
+        vec_dst = _maybe_recast_from_f4_f6(vec_dst, dst_ty)
         frgDst.store(vec_dst)
 
         # Copy the results back to c
-        copy_atom_stg = cute.make_copy_atom(nvgpu.CopyUniversalOp(), gDst.element_type)
-        cute.copy(copy_atom_stg, frgDst, thrDst)
+        copy_atom_stg = make_copy_atom(nvgpu.CopyUniversalOp(), gDst.element_type)
+        copy(copy_atom_stg, frgDst, thrDst)
 
 
 @CuTeDSL.jit(preprocess=False)
 def _convert(
-    src: cute.Tensor,
-    dst: cute.Tensor,
+    src: Tensor,
+    dst: Tensor,
     leading_mode: Constexpr,
     elem_per_copy: Constexpr,
-):
+) -> None:
     # Step 1. figure proper tv_layout
     src_ty = src.element_type
     dst_ty = dst.element_type
 
-    tv_layout = cute.make_layout((128, elem_per_copy), stride=(elem_per_copy, 1))
+    tv_layout = make_layout((128, elem_per_copy), stride=(elem_per_copy, 1))
 
     # Step 2. maybe recast from f4 tensor
-    src, src_tv_layout = _maybe_recast_tensor_from_f4(src, tv_layout)
-    dst, dst_tv_layout = _maybe_recast_tensor_from_f4(dst, tv_layout)
+    src, src_tv_layout = _maybe_recast_tensor_from_f4_f6(src, tv_layout)
+    dst, dst_tv_layout = _maybe_recast_tensor_from_f4_f6(dst, tv_layout)
     src_shape = src.shape
     # predicate tensor
-    idA = cute.make_identity_tensor(src.shape)
+    idA = make_identity_tensor(src.shape)
 
     # Step 3. select a proper tiling pattern as (...,TileV, ...)
     src_cta_tiler = [
         1,
-    ] * cute.rank(src.layout)
-    src_cta_tiler[leading_mode] = cute.size(src_tv_layout)  # (...,TileV,...)
+    ] * rank(src.layout)
+    src_cta_tiler[leading_mode] = size(src_tv_layout)  # (...,TileV,...)
     dst_cta_tiler = [
         1,
-    ] * cute.rank(dst.layout)
-    dst_cta_tiler[leading_mode] = cute.size(dst_tv_layout)  # (...,TileV,...)
+    ] * rank(dst.layout)
+    dst_cta_tiler[leading_mode] = size(dst_tv_layout)  # (...,TileV,...)
 
     # Step 4. partition input and output tensor by cta tiler.
-    gS = cute.zipped_divide(
-        src, tuple(src_cta_tiler)
-    )  # ((...,TileV,...),(...,RestV,...))
-    cS = cute.zipped_divide(
-        idA, tuple(src_cta_tiler)
-    )  # ((...,TileV,...),(...,RestV,...))
-    gD = cute.zipped_divide(
-        dst, tuple(dst_cta_tiler)
-    )  # ((...,TileV,...),(...,RestV,...))
+    gS = zipped_divide(src, tuple(src_cta_tiler))  # ((...,TileV,...),(...,RestV,...))
+    cS = zipped_divide(idA, tuple(src_cta_tiler))  # ((...,TileV,...),(...,RestV,...))
+    gD = zipped_divide(dst, tuple(dst_cta_tiler))  # ((...,TileV,...),(...,RestV,...))
     # print(f"{gS.type=}")
 
     _convert_kernel(
@@ -200,8 +498,8 @@ def _convert(
         src_ty,
         dst_ty,
     ).launch(
-        grid=[cute.size(gS, mode=[1]), 1, 1],
-        block=[cute.size(src_tv_layout, mode=[0]), 1, 1],
+        grid=[size(gS, mode=[1]), 1, 1],
+        block=[size(src_tv_layout, mode=[0]), 1, 1],
     )
 
 
@@ -209,516 +507,47 @@ def _convert(
 # And when src or dst dtype is narrow precision(Float4E2M1FN/Float8E8M0FNU/Float8E4M3FN), the shape of
 # their leading dimension should be 4(fp8)/8(fp4) element align. (nvgpu.cvt_fptrunc/cvt_fpext
 # needs 32-bits aligned input/output)
-def convert(src: cute.Tensor, dst: cute.Tensor):
-    assert len(src.shape) == len(dst.shape), (
+def convert(src: Tensor, dst: Tensor) -> None:
+    src_shape = src.shape
+    src_stride = src.stride
+    assert isinstance(src_shape, tuple) and isinstance(src_stride, tuple)
+    dst_shape = dst.shape
+    assert isinstance(dst_shape, tuple)
+    assert len(src_shape) == len(dst_shape), (
         "Shape of src and dst tensors should be the same rank."
     )
     # find leading mode
     leading_mode = [
         idx
-        for idx, (shape, stride) in enumerate(zip(src.shape, src.stride))
-        if shape > 1 and stride == 1
+        for idx, (shape, stride) in enumerate(zip(src_shape, src_stride))
+        if shape > 1 and stride == 1  # type: ignore[operator]
     ]
     if len(leading_mode) != 1:
         raise ValueError(f"Leading mode should be unique, but got {leading_mode}")
-    leading_mode = leading_mode[0]
+    leading_mode = leading_mode[0]  # type: ignore[assignment]
 
     elem_per_copy = 2
 
-    if src.element_type.width == 4 or dst.element_type.width == 4:
+    src_elem_type = src.element_type
+    dst_elem_type = dst.element_type
+    assert not is_int_tuple_type(src_elem_type) and not is_int_tuple_type(dst_elem_type)
+    if src_elem_type.width == 4 or dst_elem_type.width == 4:
         elem_per_copy = 8
-    elif src.element_type.width == 8 or dst.element_type.width == 8:
+    elif src_elem_type.width == 8 or dst_elem_type.width == 8:
         elem_per_copy = 4
+    elif src_elem_type.width == 6 or dst_elem_type.width == 6:
+        elem_per_copy = 16  # 16*f6 elements per 96 bits(12 bytes)
     assert (
-        src.shape[leading_mode] % elem_per_copy == 0
-        and dst.shape[leading_mode] % elem_per_copy == 0
+        src.shape[leading_mode] % elem_per_copy == 0  # type: ignore[index, call-overload]
+        and dst.shape[leading_mode] % elem_per_copy == 0  # type: ignore[index, call-overload]
     )
+
     _convert(src, dst, leading_mode, elem_per_copy)
 
 
 #########################################
-# Testing utilities
+# Tuning utilities
 #########################################
-
-
-def sample_pytest(rand_cfg=None):
-    """
-    Decorator to randomly sample pytest parametrized tests.
-    rand_cfg: Tuple[int, float] - (random_seed, sample_ratio)
-    Sampling is disabled when:
-    - A specific test is selected (via -k or direct test path)
-    - Not running under pytest
-    """
-    import functools
-    import os
-    import random
-    import sys
-
-    import pytest
-
-    seed, sample_ratio = rand_cfg
-    random.seed(seed)
-
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            if rand_cfg is not None and "PYTEST_CURRENT_TEST" in os.environ:
-                # Check if test was explicitly selected like ::test_name[param1-param2-...]
-                if "-k" in sys.argv or any(".py::" in arg for arg in sys.argv):
-                    # Test was explicitly selected, don't skip
-                    return func(*args, **kwargs)
-
-                if random.uniform(0.0, 1.0) > sample_ratio:
-                    pytest.skip(f"Randomly skipped (sampling ratio: {sample_ratio})")
-            return func(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
-
-
-#########################################
-# Benchmarking utilities
-#########################################
-
-
-class JitArguments:
-    """
-    A type to hold both args and kwargs for passing to a kernel while benchmarking.
-    """
-
-    def __init__(self, *args, **kwargs):
-        self.args = args
-        self.kwargs = kwargs
-
-
-def _cuda_success(
-    err: Union[tuple, cuda_runtime.cudaError_t, cuda_driver.CUresult], message: str
-):
-    """
-    Helper function to check CUDA API errors.
-    """
-    if isinstance(err, tuple):
-        _cuda_success(err[0], message)
-    elif isinstance(err, cuda_runtime.cudaError_t):
-        error_message = cuda_runtime.cudaGetErrorString(err)[1].decode("utf-8")
-        if err != cuda_runtime.cudaError_t.cudaSuccess:
-            raise RuntimeError(f"{message} : {error_message}")
-    elif isinstance(err, cuda_driver.CUresult):
-        if err != cuda_driver.CUresult.CUDA_SUCCESS:
-            error_message = cuda_driver.cuGetErrorString(err)[1].decode("utf-8")
-            raise RuntimeError(f"{message} : {error_message}")
-    else:
-        raise TypeError(
-            f"{err} is an unexpected type : it should be a cudaError_t or CUresult"
-        )
-
-
-def _does_kernel_use_stream(
-    kernel: Callable, stream: cuda_driver.CUstream, *args, **kwargs
-):
-    """
-    This function checks if the kernel uses the provided non-default stream.
-    It does this by capturing the stream and then checking if any kernels were launched.
-    :param kernel: The kernel to check
-    :type kernel: Callable
-    :param stream: The stream to check
-    :type stream: cuda_driver.CUstream
-    :return: True if the kernel uses the stream, False otherwise
-    :rtype: bool
-    """
-
-    assert int(stream) != int(cuda_driver.CUstream_flags.CU_STREAM_DEFAULT), (
-        "Stream must be a non-default stream"
-    )
-
-    err = cuda_runtime.cudaStreamBeginCapture(
-        stream, cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal
-    )
-    _cuda_success(err, "Error on stream capture")
-
-    kernel(*args, **kwargs)
-
-    err, graph = cuda_runtime.cudaStreamEndCapture(stream)
-    _cuda_success(err, "Error on stream capture")
-
-    # Get number of nodes in warmup graph to check it matches what is expected
-    err, _, num_nodes = cuda_runtime.cudaGraphGetNodes(graph)
-    _cuda_success(err, "Error on querying graph")
-    return num_nodes > 0
-
-
-def benchmark(
-    callable: Callable,
-    *,
-    warmup_iterations: int = 10,
-    iterations: int = 100,
-    stream: Optional[cuda_driver.CUstream] = None,
-    kernel_arguments: Optional[JitArguments] = None,
-    workspace_generator: Optional[Callable[[], JitArguments]] = None,
-    workspace_count: int = 1,
-    use_cuda_graphs: bool = False,
-) -> float:
-    """Benchmarks a callable function with the specified parameters.
-
-    For example,
-    .. code-block:: python
-
-        from cutlass.cute.testing import benchmark
-
-        @cute.jit
-        def user_function(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, stream: cuda_driver.CUstream):
-            # contents of the function
-            pass
-
-        time_us = benchmark(user_function, kernel_arguments=JitArguments(a, b, c, stream)
-                            warmup_iterations=10, iterations=100
-                            stream=stream)
-
-    To prevent skewing results by repeately accessing the L2 cache, use the workspace_count and workspace_generator
-    parameters to cycle through a number of different workspaces.
-
-    .. code-block:: python
-
-        from cutlass.cute.testing import benchmark
-
-        @cute.jit
-        def user_function(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor):
-            # contents of the function
-            pass
-
-        def workspace_generator():
-            # create a, b, and c
-            return JitArguments(a, b, c)
-
-        time_us = benchmark(user_function,
-                            workspace_generator=workspace_generator,
-                            workspace_count=10,
-                            warmup_iterations=10000,
-                            iterations=1000)
-
-    To benchmark you may always configure the function being profiled (callable), the warmup iterations, and
-    the number of profiling iterations.
-
-    Whenever the kernel being benchmarked runs in a non-default stream, the stream must be provided through the stream parameter.
-
-    To use CUDA graphs, the callable must be a compiled @cute.jit annotated function.
-    When using CUDA graphs, the kernel must be launched in a non-default stream.
-
-    :param callable: The function to benchmark
-    :type callable: Callable
-    :param warmup_iterations: Number of warmup iterations, defaults to 10
-    :type warmup_iterations: int, optional
-    :param iterations: Number of benchmark iterations, defaults to 100
-    :type iterations: int, optional
-    :param stream: Stream kernel is launched in, defaults to CUDA stream default
-    :type stream: CUstream, None
-    :param kernel_arguments: Kernel arguments to launch callable with, defaults to None
-    :type kernel_arguments: JitArguments, None
-    :param workspace_generator: Function that returns kernel arguments, defaults to None
-    :type workspace_generator: Callable
-    :param workspace_count: Number of workspaces (arguments) to loop through, looping through enough workspaces will keep the L2 cache cold
-    :type workspace_count: int, optional
-    :param use_cuda_graphs: Whether to use cuda graphs, defaults to False
-    :type use_cuda_graphs: bool, optional
-
-    :return: The benchmark time in microseconds
-    :rtype: float
-    """
-
-    if stream is None:
-        stream = cuda_driver.CUstream(cuda_driver.CUstream_flags.CU_STREAM_DEFAULT)
-
-    if workspace_count < 1:
-        raise ValueError("workspace_count must be at least 1")
-
-    time_us = float("nan")
-    if workspace_generator == None:
-        # If no workspace generator is provided, we need a single workspace
-        if workspace_count != 1:
-            raise ValueError("Need a single workspace if not providing a generator")
-
-        # If no workspace generator is provided, we need a kernel_argument
-        if kernel_arguments == None:
-            raise ValueError(
-                "Please pass a kernel argument if not providing a generator"
-            )
-        workspace_generator = lambda: kernel_arguments
-
-    workspaces = [workspace_generator() for _ in range(workspace_count)]
-
-    for workspace in workspaces:
-        if type(workspace) != JitArguments:
-            raise TypeError(
-                "workspace_generator and/or kernel_arguments should use JitArguments type"
-            )
-
-    def _loop_and_call_kernel(iterations: int, workspace_index: int = 0):
-        for _ in range(iterations):
-            current_workspace = workspaces[workspace_index]
-            callable(*current_workspace.args, **current_workspace.kwargs)
-            workspace_index = (workspace_index + 1) % workspace_count
-        return workspace_index
-
-    # Create CUDA events for timing
-    err, start_event = cuda_driver.cuEventCreate(
-        cuda_driver.CUevent_flags.CU_EVENT_DEFAULT
-    )
-    _cuda_success(err, "Error on creating event")
-    err, end_event = cuda_driver.cuEventCreate(
-        cuda_driver.CUevent_flags.CU_EVENT_DEFAULT
-    )
-    _cuda_success(err, "Error on creating event")
-
-    elapsed_time = float("nan")
-
-    if use_cuda_graphs:
-        # Check if the callable is a JitCompiledFunction or JitExecutor
-        # These are functions that can be called to launch kernels
-        compiled_types = (
-            cutlass.base_dsl.jit_executor.JitCompiledFunction,
-            cutlass.base_dsl.jit_executor.JitExecutor,
-        )
-        if not isinstance(callable, compiled_types):
-            raise TypeError("Function must be precompiled to be used with CUDA Graphs")
-
-        # Check if the stream is a non-default stream
-        if int(stream) == int(cuda_driver.CUstream_flags.CU_STREAM_DEFAULT):
-            raise ValueError(
-                "Measuring with CUDA Graphs requires executing in a non-default stream"
-            )
-
-        workspace_index = 0
-
-        # Capture warmup graph
-        err = cuda_runtime.cudaStreamBeginCapture(
-            stream, cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal
-        )
-        _cuda_success(err, "Error on stream capture")
-
-        workspace_index = _loop_and_call_kernel(warmup_iterations)
-        err, gwarm = cuda_runtime.cudaStreamEndCapture(stream)
-        _cuda_success(err, "Error on stream capture")
-
-        # Get number of nodes in warmup graph to check it matches what is expected
-        err, _, num_nodes = cuda_runtime.cudaGraphGetNodes(gwarm)
-        _cuda_success(err, "Error on querying graph")
-        # Assertion is >= since we may launch multiple kernels in one host function
-        if num_nodes < warmup_iterations:
-            raise ValueError(
-                "CUDA stream passed to benchmark does not match the stream the kernel was launched in"
-            )
-
-        # Capture profiling graph
-        err = cuda_runtime.cudaStreamBeginCapture(
-            stream, cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal
-        )
-        _cuda_success(err, "Error on stream capture")
-        _loop_and_call_kernel(iterations, workspace_index)
-        err, gprofile = cuda_runtime.cudaStreamEndCapture(stream)
-        _cuda_success(err, "Error on stream capture")
-
-        # Instantiate graphs
-        err, gwarm = cuda_runtime.cudaGraphInstantiate(gwarm, 0)
-        _cuda_success(err, "Error on graph instantiation")
-        err, gprofile = cuda_runtime.cudaGraphInstantiate(gprofile, 0)
-        _cuda_success(err, "Error on graph instantiation")
-
-        # Launch warmup graph
-        err = cuda_runtime.cudaGraphLaunch(gwarm, stream)
-        _cuda_success(err, "Error on graph launch")
-
-        # Record start time
-        err = cuda_driver.cuEventRecord(start_event, stream)
-        _cuda_success(err, "Error on recording event")
-
-        # Launch profiling graph
-        err = cuda_runtime.cudaGraphLaunch(gprofile, stream)
-        _cuda_success(err, "Error on graph launch")
-
-        # Record end time
-        err = cuda_driver.cuEventRecord(end_event, stream)
-        _cuda_success(err, "Error on recording event")
-        err = cuda_driver.cuEventSynchronize(end_event)
-        _cuda_success(err, "Error on synchronizing event")
-
-        # Get elapsed time
-        err, elapsed_time = cuda_driver.cuEventElapsedTime(start_event, end_event)
-        _cuda_success(err, "Error on querying event")
-
-        # Destroy graphs
-        err = cuda_runtime.cudaGraphExecDestroy(gwarm)
-        _cuda_success(err, "Error on destroying graph")
-        err = cuda_runtime.cudaGraphExecDestroy(gprofile)
-        _cuda_success(err, "Error on destroying graph")
-
-    else:
-        if int(stream) != int(
-            cuda_driver.CUstream_flags.CU_STREAM_DEFAULT
-        ) and not _does_kernel_use_stream(
-            callable, stream, *workspaces[0].args, **workspaces[0].kwargs
-        ):
-            raise ValueError(
-                "CUDA stream passed to benchmark does not match the stream the kernel was launched in"
-            )
-
-        # Not using graphs
-        # Warmup
-        workspace_index = _loop_and_call_kernel(warmup_iterations)
-        # Record start event
-        err = cuda_driver.cuEventRecord(start_event, stream)
-        _cuda_success(err, "Error on recording event")
-        _loop_and_call_kernel(iterations, workspace_index)
-        # Record end event
-        err = cuda_driver.cuEventRecord(end_event, stream)
-        _cuda_success(err, "Error on recording event")
-        # Synchronize end event
-        err = cuda_driver.cuEventSynchronize(end_event)
-        _cuda_success(err, "Error on synchronizing event")
-        err, elapsed_time = cuda_driver.cuEventElapsedTime(start_event, end_event)
-        _cuda_success(err, "Error on querying event")
-
-    # Destroy events
-    err = cuda_driver.cuEventDestroy(start_event)
-    _cuda_success(err, "Error on destroying event")
-    err = cuda_driver.cuEventDestroy(end_event)
-    _cuda_success(err, "Error on destroying event")
-
-    return elapsed_time / iterations * 1e3
-
-
-def get_workspace_count(
-    one_workspace_bytes: int, warmup_iterations: int, iterations: int
-) -> int:
-    """Calculate the number of workspaces needed to fill L2 cache.
-
-    :param one_workspace_bytes: Size of one workspace in bytes
-    :type one_workspace_bytes: int
-    :param warmup_iterations: Number of warmup iterations
-    :type warmup_iterations: int
-    :param iterations: Number of iterations
-    :type iterations: int
-    :return: Number of workspaces needed
-    :rtype: int
-    """
-    num_l2_cache_bytes = cutlass.utils.HardwareInfo().get_l2_cache_size_in_bytes()
-    num_workspaces = (num_l2_cache_bytes * 3) // one_workspace_bytes + 1
-    num_iters = warmup_iterations + iterations
-    return num_iters if num_iters < num_workspaces else num_workspaces
-
-
-#########################################
-# Autotuning/Tuning utilities
-#########################################
-
-
-def _benchmark_for_autotune(
-    callable: Callable,
-    *args,
-    warmup_iterations: int,
-    iterations: int,
-    use_cold_l2: bool,
-    print_verbose: bool,
-    current_stream: Optional[cuda_driver.CUstream] = None,
-    **kwargs,
-) -> float:
-    """Benchmarks a callable function with the specified parameters.
-
-    This function differs from the benchmark function in that it is used for autotuning. In this case we
-    do not loop through workspaces to keep the L2 cache cold. Instead we rely on writing to an L2 cache sized address to keep the L2 cache cold.
-
-    The primary reason for doing this is that we do not have information on how to generate the workspaces for the kernel when autotuning.
-    We also do not have information on how much memory the workspaces take up.
-
-    This benchmarking is done as a close approximation of the actual runtime of the kernel in an E2E system,
-    where we may have clock throttling, a warm cache, or other factors that could affect the runtime of the kernel.
-
-    :param callable: The function to benchmark
-    :type callable: Callable
-    :param args: Arguments to pass to the callable function
-    :param warmup_iterations: Number of warmup iterations, defaults to 10
-    :type warmup_iterations: int, optional
-    :param iterations: Number of benchmark iterations, defaults to 100
-    :type iterations: int, optional
-    :param use_cold_l2: Whether to clear L2 cache between runs, defaults to True
-    :type use_cold_l2: bool, optional
-    :param print_verbose: Whether to print verbose output, defaults to False
-    :type print_verbose: bool, optional
-    :param current_stream: Stream to benchmark in, defaults to CUDA stream default
-    :type current_stream: CUstream, None
-    :param kwargs: Additional keyword arguments to pass to the callable function
-
-    :return: The benchmark time in microseconds
-    :rtype: float
-    """
-    if current_stream is None:
-        current_stream = cuda_driver.CUstream(
-            cuda_driver.CUstream_flags.CU_STREAM_DEFAULT
-        )
-
-    if int(current_stream) != int(
-        cuda_driver.CUstream(cuda_driver.CUstream_flags.CU_STREAM_DEFAULT)
-    ) and not _does_kernel_use_stream(callable, current_stream, *args, **kwargs):
-        raise ValueError(f"Incorrect stream passed to kernel: {current_stream}")
-
-    if use_cold_l2:
-        from cutlass.utils import HardwareInfo
-
-        # use memset to clear L2 cache
-        hardware_info = HardwareInfo()
-        num_l2_cache_bytes = hardware_info.get_l2_cache_size_in_bytes()
-        err, cache_ptr = cuda_driver.cuMemAlloc(int(num_l2_cache_bytes))
-        _cuda_success(err, "Error on allocating memory")
-
-    # Create CUDA events for timing
-    err, start_event = cuda_driver.cuEventCreate(
-        cuda_driver.CUevent_flags.CU_EVENT_DEFAULT
-    )
-    _cuda_success(err, "Error on creating event")
-    err, end_event = cuda_driver.cuEventCreate(
-        cuda_driver.CUevent_flags.CU_EVENT_DEFAULT
-    )
-    _cuda_success(err, "Error on creating event")
-    try:
-        # warmup
-        for _ in range(warmup_iterations):
-            callable(*args, **kwargs)
-
-        time = 0
-        execution_time_ms = []
-        for _ in range(iterations):
-            if use_cold_l2:
-                # clear L2 cache by memset to zero for every run
-                err = cuda_driver.cuMemsetD32Async(
-                    cache_ptr, 0, int(num_l2_cache_bytes // 4), current_stream
-                )
-                _cuda_success(err, "Error on memset")
-            err = cuda_driver.cuEventRecord(start_event, current_stream)
-            _cuda_success(err, "Error on recording event")
-            callable(*args, **kwargs)
-            err = cuda_driver.cuEventRecord(end_event, current_stream)
-            _cuda_success(err, "Error on recording event")
-            err = cuda_driver.cuEventSynchronize(end_event)
-            _cuda_success(err, "Error on synchronizing event")
-            err, elapsed_time = cuda_driver.cuEventElapsedTime(start_event, end_event)
-            _cuda_success(err, "Error on querying event")
-            execution_time_ms.append(elapsed_time)
-        # unit: us
-        time_us = sum(execution_time_ms) / len(execution_time_ms)
-    except Exception as e:
-        print(f"This config execution error: {e}")
-        time_us = float("inf")
-    if print_verbose:
-        print(f"Execution time: {time_us:.4f} us")
-
-    if use_cold_l2:
-        err = cuda_driver.cuMemFree(cache_ptr)
-        _cuda_success(err, "Error on freeing memory")
-    err = cuda_driver.cuEventDestroy(start_event)
-    _cuda_success(err, "Error on destroying event")
-    err = cuda_driver.cuEventDestroy(end_event)
-    _cuda_success(err, "Error on destroying event")
-    return time_us
 
 
 class autotune_jit:
@@ -750,30 +579,40 @@ class autotune_jit:
     the autotuner will not recompile the kernel.
     """
 
-    logger = None
+    _logger: Optional[logging.Logger] = None
 
     @classmethod
-    def _initialize_logger(cls):
+    def _initialize_logger(cls) -> None:
         """Ensure the logger is initialized"""
-        if cls.logger is None:
-            cls.logger = logging.getLogger(__name__ + "_Autotune")
-            if not cls.logger.handlers:
+        if cls._logger is None:
+            cls._logger = logging.getLogger(__name__ + "_Autotune")
+            if not cls._logger.handlers:
                 handler = logging.StreamHandler()
                 formatter = logging.Formatter(
                     "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
                 )
                 handler.setFormatter(formatter)
-                cls.logger.addHandler(handler)
+                cls._logger.addHandler(handler)
             if (
                 os.environ.get("CUTE_DSL_LOG_AUTOTUNE") is not None
                 and os.environ.get("CUTE_DSL_LOG_AUTOTUNE") != "0"
             ):
-                cls.logger.setLevel(logging.INFO)
+                cls._logger.setLevel(logging.INFO)
+
+    @classmethod
+    def log(cls) -> logging.Logger:
+        """Return the initialized logger; asserts ``_initialize_logger`` ran first."""
+        assert cls._logger is not None, "logger is not initialized"
+        return cls._logger
 
     @classmethod
     def _create_tuning_wrapper(
-        cls, func, warmup_iterations, iterations, autotune_update_params
-    ):
+        cls,
+        func: Callable[..., Any],
+        warmup_iterations: int,
+        iterations: int,
+        autotune_update_params: list[str],
+    ) -> Callable[..., Any]:
         """Create a wrapper function that performs auto-tuning
 
         Args:
@@ -782,21 +621,23 @@ class autotune_jit:
         Returns:
             Decorated wrapper function
         """
+        from cutlass.cute import compile
+        from cutlass.testing import _benchmark_for_autotune
 
         # Initialize autotune parameters
         if not hasattr(func, "_autotune_params"):
-            func._original_func = func
-            func._autotune_params = {}
-            func._autotune_update_params = autotune_update_params
-            func._best_kernel = dict()
-            func._best_config = dict()
+            func._original_func = func  # type: ignore[attr-defined]
+            func._autotune_params = {}  # type: ignore[attr-defined]
+            func._autotune_update_params = autotune_update_params  # type: ignore[attr-defined]
+            func._best_kernel = dict()  # type: ignore[attr-defined]
+            func._best_config = dict()  # type: ignore[attr-defined]
 
             # Create wrapper function for auto-tuning
             @functools.wraps(func)
-            def tuning_wrapper(*args, **kwargs):
-                parameters = inspect.signature(func._original_func).parameters.keys()
-                tuning_key = list()
-                for param_name in func._autotune_update_params:
+            def tuning_wrapper(*args: Any, **kwargs: Any) -> Any:
+                parameters = inspect.signature(func._original_func).parameters.keys()  # type: ignore[attr-defined]
+                tuning_key: Any = list()
+                for param_name in func._autotune_update_params:  # type: ignore[attr-defined]
                     if param_name in kwargs.keys():
                         tuning_key.append(kwargs[param_name])
                     else:
@@ -804,14 +645,14 @@ class autotune_jit:
                         if index < len(args):
                             tuning_key.append(args[index])
                 tuning_key = tuple(tuning_key)
-                if tuning_key in func._best_kernel.keys():
-                    cls.logger.info(
-                        f"Using cached best configuration: {func._best_config[tuning_key]}"
+                if tuning_key in func._best_kernel.keys():  # type: ignore[attr-defined]
+                    cls.log().info(
+                        f"Using cached best configuration: {func._best_config[tuning_key]}"  # type: ignore[attr-defined]
                     )
-                    return func._best_kernel[tuning_key](*args, **kwargs)
+                    return func._best_kernel[tuning_key](*args, **kwargs)  # type: ignore[attr-defined]
 
                 # Get all parameter configurations
-                params_dict = func._autotune_params
+                params_dict = func._autotune_params  # type: ignore[attr-defined]
                 keys = list(params_dict.keys())
                 values = list(params_dict.values())
 
@@ -825,29 +666,31 @@ class autotune_jit:
                 for config_values in product(*values):
                     # Build current configuration
                     current_config = dict(zip(keys, config_values))
-                    cls.logger.info(f"Tuning configuration: {current_config}")
+                    cls.log().info(f"Tuning configuration: {current_config}")
 
                     try:
                         # Call the original function, using current configuration to replace default parameters
                         # For example, if current_config contains "cluster_shape_mn": (2, 1)
                         # It will override func's default parameter value
                         merged_kwargs = {**kwargs, **current_config}
-                        compiled_func = cute.compile(
-                            func._original_func, *args, **merged_kwargs
+                        compiled_func = compile(
+                            func._original_func,  # type: ignore[attr-defined]
+                            *args,
+                            **merged_kwargs,
                         )
 
                         # Detect which constexpr arguments we need to remove from args and merged_kwargs
                         # This is done because after compiling our function signature will change, removing all constexpr arguments.
                         indexes_to_remove = list()
-                        for arg in compiled_func.args_spec.get_constexpr_args():
+                        for arg in compiled_func.execution_args.get_constexpr_args():
                             if arg["argument_name"] in merged_kwargs:
                                 del merged_kwargs[arg["argument_name"]]
                             elif arg["argument_index"] is not None:
                                 indexes_to_remove.append(arg["argument_index"])
-                            if arg["argument_name"] not in func._autotune_update_params:
+                            if arg["argument_name"] not in func._autotune_update_params:  # type: ignore[attr-defined]
                                 # Handle the case where the programmer avoided autotuning over constexpr values, and
                                 # recompile in that case
-                                func._autotune_update_params.append(
+                                func._autotune_update_params.append(  # type: ignore[attr-defined]
                                     arg["argument_name"]
                                 )
 
@@ -867,7 +710,7 @@ class autotune_jit:
                             **merged_kwargs,
                         )
 
-                        cls.logger.info(f"   Execution time: {cur_time} us")
+                        cls.log().info(f"   Execution time: {cur_time} us")
 
                         # Update best results
                         if cur_time < min_time:
@@ -876,16 +719,16 @@ class autotune_jit:
                             best_config = current_config
 
                     except NotImplementedError as e:
-                        cls.logger.info(
+                        cls.log().info(
                             f"   Encountered unimplemented error, abort execution: {e}"
                         )
                         raise e
                     except (ValueError, TypeError) as e:
-                        cls.logger.info(f"   Configuration parameter skipping: {e}")
+                        cls.log().info(f"   Configuration parameter skipping: {e}")
                         raise e
                         continue
                     except Exception as e:
-                        cls.logger.info(f"   Execution error skipping: {e}")
+                        cls.log().info(f"   Execution error skipping: {e}")
                         raise e
                         continue
 
@@ -895,12 +738,12 @@ class autotune_jit:
                 if best_kernel is None:
                     raise ValueError("No best kernel found")
 
-                cls.logger.info(
+                cls.log().info(
                     f"Best configuration: {best_config}, execution time: {min_time} us"
                 )
-                cls.logger.info(f"Total tuning time: {tuning_time} s")
-                func._best_kernel[tuning_key] = best_kernel
-                func._best_config[tuning_key] = best_config
+                cls.log().info(f"Total tuning time: {tuning_time} s")
+                func._best_kernel[tuning_key] = best_kernel  # type: ignore[attr-defined]
+                func._best_config[tuning_key] = best_config  # type: ignore[attr-defined]
                 return best_kernel(*args, **kwargs)
 
             # Append autotune wrapper to not conflict with the jit kernel names
@@ -913,11 +756,11 @@ class autotune_jit:
 
     def __init__(
         self,
-        params_dict: Dict[str, List[Any]] = None,
-        update_on_change: List[str] = None,
-        warmup_iterations=10,
-        iterations=100,
-    ):
+        params_dict: Optional[Dict[str, List[Any]]] = None,
+        update_on_change: Optional[List[str]] = None,
+        warmup_iterations: int = 10,
+        iterations: int = 100,
+    ) -> None:
         """Initialize the autotune_jit decorator.
 
         :param params_dict: Dictionary containing parameter names and their possible values
@@ -940,7 +783,7 @@ class autotune_jit:
         self.warmup_iterations = warmup_iterations
         self.iterations = iterations
 
-    def __call__(self, func):
+    def __call__(self, func: Callable[..., Any]) -> Callable[..., Any]:
         """Called when class instance is used as a decorator.
 
         :param func: Function to be decorated
@@ -965,111 +808,93 @@ class autotune_jit:
         return result_func
 
 
-def tune(
-    func: Callable[[Any], Callable[[], Any]],
-    params_dict: Dict[str, List[Any]] = None,
-    kernel_arguments: JitArguments = JitArguments(),
-    warmup_iterations=10,
-    iterations=100,
-    stream: Optional[cuda_driver.CUstream] = None,
-) -> Dict[str, Any]:
-    """Tuning tool to suport arbitrary functions. The user must provide a function that returns a callable, which
-    takes no arguments to be tuned over.
-    Best practice is to return a jit function that is compiled with cute.compile for optimal performance.
-    For example:
-    .. code-block:: python
+################################################
+# Deprecated re-exports
+################################################
+# The symbols below have moved to ``cutlass.testing``. They are kept here as
+# ``@deprecated`` shims so existing ``cutlass.cute.testing.*`` call sites keep
+# working but emit ``DeprecationWarning``. Please migrate to
+# ``cutlass.testing.*``; these shims will be removed in a future release.
 
-        def user_function(param1=1, param2=2, param3=3) -> Callable[[], Any]:
-            # contents of the function
-            return lambda : compiled_func(param1, param2, param3)
+from typing_extensions import deprecated as _deprecated
 
-        config = tune(user_function, params_dict={'param1': [1, 2, 3], 'param2': [4, 5, 6]}, update_on_change=['param3'])
+from cutlass.testing import CantImplementError as _CantImplementError
+from cutlass.testing import CuptiProfiler as _CuptiProfiler
+from cutlass.testing import JitArguments as _JitArguments
+from cutlass.testing import TensorInitConfig as _TensorInitConfig
+from cutlass.testing import add_tensor_init_args as _add_tensor_init_args
+from cutlass.testing import benchmark as _benchmark
+from cutlass.testing import get_workspace_count as _get_workspace_count
+from cutlass.testing import sample_pytest as _sample_pytest
+from cutlass.testing import should_use_normal_init as _should_use_normal_init
+from cutlass.testing import (
+    tensor_init_config_from_args as _tensor_init_config_from_args,
+)
+from cutlass.testing import tune as _tune
+from cutlass.testing import validate_tensor_init_args as _validate_tensor_init_args
 
-    :param func: Function to be tuned, note that errors raised in the function will be ignored and the next configuration will be tried.
-    :type func: Callable[[Any], Callable[[], Any]]
-    :param params_dict: Dictionary containing parameter names and their possible values
-    :type params_dict: Dict[str, List[Any]], optional
-    :param kernel_arguments: Kernel arguments to launch callable with, defaults to JitArguments()
-    :type kernel_arguments: JitArguments, optional
-    :param warmup_iterations: Number of warmup iterations, defaults to 10
-    :type warmup_iterations: int, optional
-    :param iterations: Number of benchmark iterations, defaults to 100
-    :type iterations: int, optional
-    :param stream: Stream kernel is launched in, defaults to CUDA stream default
-    :type stream: CUstream, None
-    :return: Best configuration
-    :rtype: Dict[str, Any]
-    """
-    logger = logging.getLogger(__name__ + "_Autotune")
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-    if (
-        os.environ.get("CUTE_DSL_LOG_AUTOTUNE") is not None
-        and os.environ.get("CUTE_DSL_LOG_AUTOTUNE") != "0"
-    ):
-        logger.setLevel(logging.INFO)
 
-    if stream is None:
-        stream = cuda_driver.CUstream(cuda_driver.CUstream_flags.CU_STREAM_DEFAULT)
+# --- Deprecated classes (subclass + @deprecated emits warning on instantiation) ---
 
-    # Get all parameter configurations
-    keys = list(params_dict.keys())
-    values = list(params_dict.values())
 
-    min_time = float("inf")
+@_deprecated(
+    "cute.testing.CantImplementError is deprecated, use cutlass.testing.CantImplementError instead"
+)
+class CantImplementError(_CantImplementError):
+    pass
 
-    best_config = None
-    # Record start time
-    start = time()
 
-    # Iterate through all possible configuration combinations
-    for config_values in product(*values):
-        # Build current configuration
-        current_config = dict(zip(keys, config_values))
-        logger.info(f"Tuning configuration: {current_config}")
+@_deprecated(
+    "cute.testing.CuptiProfiler is deprecated, use cutlass.testing.CuptiProfiler instead"
+)
+class CuptiProfiler(_CuptiProfiler):
+    pass
 
-        try:
-            merged_kwargs = {**kernel_arguments.kwargs, **current_config}
 
-            compiled_func = func(*kernel_arguments.args, **merged_kwargs)
-            # Benchmark the compiled function
-            cur_time = _benchmark_for_autotune(
-                compiled_func,
-                warmup_iterations=warmup_iterations,
-                iterations=iterations,
-                use_cold_l2=True,
-                print_verbose=False,
-                current_stream=stream,
-            )
+@_deprecated(
+    "cute.testing.JitArguments is deprecated, use cutlass.testing.JitArguments instead"
+)
+class JitArguments(_JitArguments):
+    pass
 
-            logger.info(f"   Execution time: {cur_time} us")
 
-            # Update best results
-            if cur_time < min_time:
-                min_time = cur_time
-                best_config = current_config
+@_deprecated(
+    "cute.testing.TensorInitConfig is deprecated, use cutlass.testing.TensorInitConfig instead"
+)
+class TensorInitConfig(_TensorInitConfig):
+    pass
 
-        except NotImplementedError as e:
-            logger.info(f"   Encountered unimplemented error, abort execution: {e}")
-            raise e
-        except (ValueError, TypeError) as e:
-            logger.info(f"   Configuration parameter skipping: {e}")
-            continue
-        except Exception as e:
-            logger.info(f"   Execution error skipping: {e}")
-            continue
 
-    end = time()
-    tuning_time = end - start
+# --- Deprecated free functions (decorator wraps callable; DeprecationWarning on call) ---
 
-    if best_config is None:
-        raise ValueError("No best kernel found")
+benchmark = _deprecated(
+    "cute.testing.benchmark is deprecated, use cutlass.testing.benchmark instead"
+)(_benchmark)
 
-    logger.info(f"Best configuration: {best_config}, execution time: {min_time} us")
-    logger.info(f"Total tuning time: {tuning_time} s")
-    return best_config
+get_workspace_count = _deprecated(
+    "cute.testing.get_workspace_count is deprecated, use cutlass.testing.get_workspace_count instead"
+)(_get_workspace_count)
+
+tune = _deprecated("cute.testing.tune is deprecated, use cutlass.testing.tune instead")(
+    _tune
+)
+
+sample_pytest = _deprecated(
+    "cute.testing.sample_pytest is deprecated, use cutlass.testing.sample_pytest instead"
+)(_sample_pytest)
+
+add_tensor_init_args = _deprecated(
+    "cute.testing.add_tensor_init_args is deprecated, use cutlass.testing.add_tensor_init_args instead"
+)(_add_tensor_init_args)
+
+validate_tensor_init_args = _deprecated(
+    "cute.testing.validate_tensor_init_args is deprecated, use cutlass.testing.validate_tensor_init_args instead"
+)(_validate_tensor_init_args)
+
+tensor_init_config_from_args = _deprecated(
+    "cute.testing.tensor_init_config_from_args is deprecated, use cutlass.testing.tensor_init_config_from_args instead"
+)(_tensor_init_config_from_args)
+
+should_use_normal_init = _deprecated(
+    "cute.testing.should_use_normal_init is deprecated, use cutlass.testing.should_use_normal_init instead"
+)(_should_use_normal_init)

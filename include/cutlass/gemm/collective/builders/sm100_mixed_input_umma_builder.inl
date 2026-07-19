@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -307,8 +307,7 @@ struct CollectiveBuilder<
                                                                TensorMapStorage);
 
   // Reduce SMEM capacity available for buffers considering extra B smem and barrier smem allocations
-  static constexpr int ReducedSmemCapacityBytes = 
-    cutlass::gemm::collective::detail::sm100_smem_capacity_bytes - KernelSmemCarveout;
+  static constexpr int ReducedSmemCapacityBytes = detail::sm100_reduced_smem_capacity_bytes<ArchTag, KernelSmemCarveout>();
 
   static constexpr int ScaleGranularityK = get_ScaleGranularityK<LayoutScale>();
   static constexpr auto stage_info = cutlass::gemm::collective::detail::sm100_compute_stage_count_or_override_mixed_input<
@@ -325,7 +324,8 @@ struct CollectiveBuilder<
     Transform2MmaPipelineStageCount,
     SchedulerPipelineStageCount,
     AccumulatorPipelineStageCount,
-    ClusterShape_MNK
+    ClusterShape_MNK,
+    ArchTag
   >;
   using CollectiveOp = cutlass::gemm::collective::CollectiveMma<
     DispatchPolicy,

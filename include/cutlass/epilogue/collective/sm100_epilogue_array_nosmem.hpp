@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -42,6 +42,7 @@
 #include "cute/tensor.hpp"
 #include "cute/numeric/numeric_types.hpp"
 #include "cutlass/cuda_host_adapter.hpp"
+#include "cutlass/numeric_conversion.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -169,6 +170,8 @@ public:
 
   template<
     bool ReuseTmem = false,
+    class LoadPipeline,
+    class LoadPipelineState,
     class AccumulatorPipeline,
     class AccumulatorPipelineState,
     class ProblemShapeMNKL,
@@ -178,6 +181,8 @@ public:
   >
   CUTLASS_DEVICE auto
   operator()(
+      [[maybe_unused]]LoadPipeline load_pipeline,
+      [[maybe_unused]]LoadPipelineState load_pipe_consumer_state,
       AccumulatorPipeline acc_pipeline,
       AccumulatorPipelineState acc_pipe_consumer_state,
       ProblemShapeMNKL problem_shape_mnkl,
@@ -357,7 +362,7 @@ public:
       copy_if(tDpD, tTR_rD_src, tR2G_rD_dst);
     }
 
-    return cute::make_tuple(acc_pipe_consumer_state);
+    return cute::make_tuple(acc_pipe_consumer_state, load_pipe_consumer_state);
   }
 
   // API with Global Accumulator in registers for FastFP32 (emulated MMA) kernels.
@@ -609,6 +614,8 @@ public:
 
   template<
     bool ReuseTmem = false,
+    class LoadPipeline,
+    class LoadPipelineState,
     class AccumulatorPipeline,
     class AccumulatorPipelineState,
     class ProblemShapeMNKL,
@@ -618,6 +625,8 @@ public:
   >
   CUTLASS_DEVICE auto
   operator()(
+      [[maybe_unused]]LoadPipeline load_pipeline,
+      [[maybe_unused]]LoadPipelineState load_pipe_consumer_state,
       AccumulatorPipeline acc_pipeline,
       AccumulatorPipelineState acc_pipe_consumer_state,
       ProblemShapeMNKL problem_shape_mnkl,
@@ -830,7 +839,12 @@ public:
 
         CUTLASS_PRAGMA_UNROLL
         for (int epi_v = 0; epi_v < size(tTR_rAcc_frg); ++epi_v) {
-          tTR_rD_frg(epi_v) = cst_callbacks.visit(tTR_rAcc_frg(epi_v), epi_v, epi_m, epi_n);
+          auto frg_visited = cst_callbacks.visit(tTR_rAcc_frg(epi_v), epi_v, epi_m, epi_n);
+          // For 4-bit output types (e.g. float_e2m1_t), the visitor returns ElementCompute
+          // (scaled float values) rather than ElementD. Explicitly convert here so the
+          // assignment is always well-typed regardless of visitor return type.
+          using VisitedElement = typename decltype(frg_visited)::Element;
+          tTR_rD_frg(epi_v) = NumericArrayConverter<ElementD, VisitedElement, FragmentSize>{}(frg_visited);
         }
 
         Tensor reduction_buffer = make_tensor(
@@ -904,7 +918,7 @@ public:
     //
     auto cst_callbacks = fusion_callbacks.template get_consumer_store_callbacks<RefSrc>(cst_args);
     epi_loop_fn(cst_callbacks, is_accumulator_needed);
-    return cute::make_tuple(acc_pipe_consumer_state);
+    return cute::make_tuple(acc_pipe_consumer_state, load_pipe_consumer_state);
   }
 
 };

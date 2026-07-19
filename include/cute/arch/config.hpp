@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -164,6 +164,9 @@
 #    define CUTE_ARCH_MXF4NVF4_2X_UE8M0_MMA_ENABLED
 #    define CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED
 #  endif
+#  if (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1)
+#    define CUTE_ARCH_MXF4NVF4_4X_UE8M0_MMA_ENABLED
+#  endif
 #endif
 
 #if defined(CUTLASS_ARCH_MMA_SM100F_ENABLED) || defined(CUTLASS_ARCH_MMA_SM103F_ENABLED)
@@ -205,4 +208,9 @@
 #if defined(CUTLASS_ARCH_MMA_SM103_ENABLED) || defined(CUTLASS_ARCH_MMA_SM100F_ENABLED)
 #  define CUTE_ARCH_TCGEN05_MXF4NVF4_MMA_ULTRA_ENABLED
 #endif
+
+#if (defined(CUTLASS_ARCH_MMA_SM103A_ENABLED) || defined(CUTLASS_ARCH_MMA_SM103F_ENABLED))
+  #define CUTE_ARCH_TCGEN05_TMEM_STAT_ENABLED
+#endif
+
 

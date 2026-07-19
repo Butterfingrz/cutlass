@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -144,7 +144,7 @@ public:
   using TileSchedulerParams = typename TileScheduler::Params;
 
   static constexpr bool IsSchedDynamicPersistent = TileScheduler::IsDynamicPersistent;
-  static constexpr bool IsTensorMapUpdateAsync = not IsSchedDynamicPersistent;
+  static constexpr bool IsTensorMapUpdateAsync = IsGroupedGemmKernel && not IsSchedDynamicPersistent;
   static constexpr bool IsDynamicCluster = not cute::is_static_v<ClusterShape>;
   static constexpr uint32_t MinTensorMapWorkspaceAlignment = 64;
 
@@ -416,7 +416,7 @@ public:
     }
     implementable &= CollectiveMainloop::can_implement(args.problem_shape, args.mainloop);
     implementable &= CollectiveEpilogue::can_implement(args.problem_shape, args.epilogue);
-    implementable &= TileScheduler::can_implement(args.scheduler);
+    implementable &= TileScheduler::can_implement(args.scheduler, args.hw_info);
     if (!implementable) {
       CUTLASS_TRACE_HOST("  CAN IMPLEMENT: Mainloop, Epilogue or Scheduler don't meet the requirements for Ptr Array Gemm or Grouped Gemm.\n");
       return implementable;
@@ -832,6 +832,12 @@ public:
     mainloop_pipeline.init_masks(cluster_shape, block_id_in_cluster);
     accumulator_pipeline.init_masks(cluster_shape, block_id_in_cluster);
 
+    // Ensure that the prefetched kernel does not touch
+    // unflushed global memory prior to this instruction.
+    // For the static grouped scheduler, the problem shapes
+    // might be produced by a previous kernel in global memory.
+    cutlass::arch::wait_on_dependent_grids();
+
     // TileID scheduler
     TileScheduler scheduler(
       (!IsTensorMapUpdateAsync || is_participant.sched || is_participant.tensor_map_updater)
@@ -842,13 +848,6 @@ public:
     );
 
     auto work_tile_info = [&] () {
-      if constexpr (!IsSchedDynamicPersistent) {
-        // Ensure that the prefetched kernel does not touch
-        // unflushed global memory prior to this instruction.
-        // For the static grouped scheduler, the problem shapes
-        // might be produced by a previous kernel in global memory.
-        cutlass::arch::wait_on_dependent_grids();
-      }
       if constexpr (IsTensorMapUpdateAsync) {
         return scheduler.initial_work_tile_info(cluster_shape, [] (typename TileScheduler::CLCResponse response) {
           CLCResponseWithAdditionalInformation response_with_additional_info = response;
